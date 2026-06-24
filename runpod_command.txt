@@ -1,0 +1,21 @@
+# Required RunPod Secrets / Environment Variables:
+#   SAFETENSORS_API_KEY        Bearer token for the OpenAI-compatible API
+#   SAFETENSORS_PANEL_USER     Basic-auth username for Gradio
+#   SAFETENSORS_PANEL_PASSWORD Basic-auth password for Gradio
+# Optional for gated/private repositories: HF_TOKEN
+# Expose HTTP ports 7860 and 8000. Attach the volume at /workspace.
+
+bash -lc "cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clone --depth 1 https://github.com/Dizzle700/model_runpod.git safetensors-rig-source; else git -C safetensors-rig-source pull --ff-only; fi && exec bash safetensors-rig-source/start_runpod.sh"
+
+# HTTP Ports:
+7860,8000
+
+
+cd /home/snipe/Code2/runpod_inference_bf16
+cp runpod_variables.template.env runpod_variables.env
+
+
+openssl rand -hex 32
+
+
+openssl rand -base64 32
