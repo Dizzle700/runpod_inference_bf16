@@ -303,12 +303,28 @@ def _restore_in_background() -> None:
         manager._append_log(f"Automatic restore failed: {exc}")
 
 
+def find_free_port(host: str, start_port: int) -> int:
+    import socket
+    port = start_port
+    while port < 65535:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                port += 1
+    return start_port
+
+
 def main() -> None:
     config.validate_security()
     demo = build_app()
     threading.Thread(target=_restore_in_background, daemon=True).start()
     auth = (config.panel_user, config.panel_password) if config.panel_user and config.panel_password else None
-    demo.queue(default_concurrency_limit=4).launch(server_name=config.panel_host, server_port=config.panel_port, auth=auth, show_error=True)
+    port = find_free_port(config.panel_host, config.panel_port)
+    if port != config.panel_port:
+        print(f"⚠️ Port {config.panel_port} was busy. Switched to {port}.")
+    demo.queue(default_concurrency_limit=4).launch(server_name=config.panel_host, server_port=port, auth=auth, show_error=True)
 
 
 if __name__ == "__main__":
