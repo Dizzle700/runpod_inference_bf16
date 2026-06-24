@@ -11,11 +11,5 @@ bash -lc "cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clo
 7860,8000
 
 
-cd /home/snipe/Code2/runpod_inference_bf16
-cp runpod_variables.template.env runpod_variables.env
-
-
-openssl rand -hex 32
-
-
-openssl rand -base64 32
+cd runpod_inference_bf16
+bash generate_env.sh

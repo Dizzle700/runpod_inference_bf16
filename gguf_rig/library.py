@@ -184,9 +184,86 @@ class ModelLibrary:
             raise RuntimeError("huggingface-hub is not installed") from exc
         destination = self.config.models_dir.joinpath(*repo_id.split("/"))
         destination.mkdir(parents=True, exist_ok=True)
+
+        class TqdmProgressWrapper:
+            def __init__(self, *args, **kwargs):
+                self._total = kwargs.get("total") or 100
+                self._n = 0
+                self._desc = kwargs.get("desc") or "Downloading"
+                self._unit = kwargs.get("unit") or "B"
+                if progress:
+                    progress(0.0, self._desc)
+
+            def update(self, n=1):
+                self._n += n
+                ratio = min(1.0, max(0.0, self._n / self._total))
+                if progress:
+                    if self._unit.lower() in ("b", "byte", "bytes"):
+                        desc = f"{self._desc} ({self._n / 1024**2:.1f}MB / {self._total / 1024**2:.1f}MB)"
+                    else:
+                        desc = f"{self._desc} ({self._n} / {self._total})"
+                    progress(ratio, desc)
+
+            def close(self):
+                if progress:
+                    progress(1.0, self._desc)
+
+            def set_description(self, desc, refresh=True):
+                self._desc = desc
+
+            def set_postfix(self, *args, **kwargs):
+                pass
+
+            def refresh(self):
+                pass
+
+            def reset(self, total=None):
+                if total is not None:
+                    self._total = total
+                self._n = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+
+        class PatchTqdm:
+            def __init__(self, wrapper):
+                self.wrapper = wrapper
+                self.originals = {}
+
+            def __enter__(self):
+                import sys
+                import tqdm
+                import tqdm.auto
+                for mod in (tqdm, tqdm.auto):
+                    if hasattr(mod, "tqdm"):
+                        self.originals[(mod, "tqdm")] = getattr(mod, "tqdm")
+                        setattr(mod, "tqdm", self.wrapper)
+                for name, module in list(sys.modules).items():
+                    if name.startswith("huggingface_hub") and module:
+                        for attr in ("tqdm", "tqdm_auto"):
+                            if hasattr(module, attr):
+                                self.originals[(module, attr)] = getattr(module, attr)
+                                try:
+                                    setattr(module, attr, self.wrapper)
+                                except Exception:
+                                    pass
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                for (target, attr), original in self.originals.items():
+                    try:
+                        setattr(target, attr, original)
+                    except Exception:
+                        pass
+
         if progress:
             progress(0.05, f"Downloading {repo_id}")
-        snapshot_download(repo_id=repo_id, local_dir=destination, token=token or None, ignore_patterns=IGNORED_WEIGHT_PATTERNS)
+
+        with PatchTqdm(TqdmProgressWrapper):
+            snapshot_download(repo_id=repo_id, local_dir=destination, token=token or None, ignore_patterns=IGNORED_WEIGHT_PATTERNS)
+
         model = self.get(destination.relative_to(self.config.models_dir).as_posix())
         if progress:
             progress(1.0, f"Saved {model.shard_count} Safetensors file(s)")

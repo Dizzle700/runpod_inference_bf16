@@ -29,6 +29,8 @@ class ActiveModel:
     gpu_memory_utilization: float = 0.90
     trust_remote_code: bool = False
     chat_template: str = ""
+    enforce_eager: bool = False
+    enable_chunked_prefill: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActiveModel":
@@ -41,6 +43,8 @@ class ActiveModel:
             gpu_memory_utilization=float(data.get("gpu_memory_utilization", 0.90)),
             trust_remote_code=bool(data.get("trust_remote_code", False)),
             chat_template=str(data.get("chat_template", "")),
+            enforce_eager=bool(data.get("enforce_eager", False)),
+            enable_chunked_prefill=bool(data.get("enable_chunked_prefill", False)),
         )
 
     def validate(self) -> None:
@@ -132,6 +136,10 @@ class VllmServerManager:
             command.append("--trust-remote-code")
         if active.chat_template:
             command.extend(["--chat-template", active.chat_template])
+        if active.enforce_eager:
+            command.append("--enforce-eager")
+        if active.enable_chunked_prefill:
+            command.append("--enable-chunked-prefill")
         return command
 
     def _health(self, timeout: float = 1.5) -> tuple[bool, str]:

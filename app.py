@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import threading
+import urllib.request
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -103,7 +105,7 @@ def download_remote(repo_id: str, progress=gr.Progress()):
         return f"❌ {html.escape(str(exc))}", gr.update()
 
 
-def activate_model(model_id: str | None, dtype: str, max_model_len: float, max_num_seqs: float, tensor_parallel_size: float, gpu_memory_utilization: float, trust_remote_code: bool, chat_template: str, confirm_switch: bool):
+def activate_model(model_id: str | None, dtype: str, max_model_len: float, max_num_seqs: float, tensor_parallel_size: float, gpu_memory_utilization: float, trust_remote_code: bool, chat_template: str, enforce_eager: bool, enable_chunked_prefill: bool, confirm_switch: bool):
     if not model_id:
         return "❌ Select a downloaded model.", dashboard_markdown()
     current = manager.status()
@@ -118,6 +120,8 @@ def activate_model(model_id: str | None, dtype: str, max_model_len: float, max_n
         gpu_memory_utilization=float(gpu_memory_utilization),
         trust_remote_code=bool(trust_remote_code),
         chat_template=(chat_template or "").strip(),
+        enforce_eager=bool(enforce_eager),
+        enable_chunked_prefill=bool(enable_chunked_prefill),
     )
     try:
         return f"✅ {manager.switch(active)}", dashboard_markdown()
@@ -137,6 +141,72 @@ def stop_server():
         return f"✅ {manager.stop()}", dashboard_markdown()
     except Exception as exc:
         return f"❌ {html.escape(str(exc))}", dashboard_markdown()
+
+
+def chat_stream(message: str, history: list[dict] | list[Any]):
+    status = manager.status()
+    if not status["healthy"]:
+        yield "❌ Server is not ready or stopped. Please activate a model first."
+        return
+
+    messages = []
+    for h in history:
+        if isinstance(h, dict):
+            messages.append({"role": h["role"], "content": h["content"]})
+        else:
+            messages.append({"role": h.role, "content": h.content})
+    messages.append({"role": "user", "content": message})
+
+    url = f"{config.local_api_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+
+    data = {
+        "model": "current",
+        "messages": messages,
+        "stream": True,
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode("utf-8"),
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            buffer = ""
+            accumulated = ""
+            for chunk in response:
+                decoded = chunk.decode("utf-8")
+                buffer += decoded
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            payload = json.loads(data_str)
+                            choice = payload.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                accumulated += content
+                                yield accumulated
+                        except Exception:
+                            pass
+    except urllib.error.HTTPError as e:
+        yield f"❌ HTTP Error {e.code}: {e.reason}"
+    except Exception as e:
+        yield f"❌ Error: {e}"
 
 
 def build_app() -> gr.Blocks:
@@ -168,7 +238,10 @@ def build_app() -> gr.Blocks:
                         max_num_seqs = gr.Number(label="Max concurrent sequences", value=64, precision=0, minimum=1)
                         tensor_parallel_size = gr.Number(label="Tensor parallel GPUs", value=1, precision=0, minimum=1)
                         gpu_memory_utilization = gr.Slider(label="GPU memory utilization", value=0.90, minimum=0.05, maximum=1.0, step=0.01)
-                    trust_remote_code = gr.Checkbox(label="Trust repository remote code (enable only for repositories you trust)")
+                    with gr.Row():
+                        trust_remote_code = gr.Checkbox(label="Trust repository remote code (enable only for repositories you trust)")
+                        enforce_eager = gr.Checkbox(label="Enforce eager mode (skip CUDA graphs, saves VRAM & speeds up startup)")
+                        enable_chunked_prefill = gr.Checkbox(label="Enable chunked prefill (helps prevent OOM on long contexts)")
                     chat_template = gr.Textbox(label="Chat-template override (normally empty)", lines=3)
                 confirm_switch = gr.Checkbox(label="I understand that switching can interrupt in-flight requests")
                 activate_button = gr.Button("Activate model", variant="primary")
@@ -182,6 +255,13 @@ def build_app() -> gr.Blocks:
                     download_button = gr.Button("Download snapshot", variant="primary")
                 remote_summary = gr.Markdown()
                 download_result = gr.Markdown()
+
+            with gr.Tab("Playground"):
+                gr.Markdown("### Chat Playground")
+                gr.ChatInterface(
+                    fn=chat_stream,
+                    type="messages",
+                )
 
             with gr.Tab("Console"):
                 console = gr.Textbox(label="vLLM output", value=manager.logs(), lines=28, interactive=False)
@@ -206,7 +286,7 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         restart_button.click(restart_server, outputs=[dashboard_message, dashboard])
         stop_button.click(stop_server, outputs=[dashboard_message, dashboard])
         refresh_models.click(refresh_library, inputs=model_select, outputs=[model_select, dashboard])
-        activate_button.click(activate_model, inputs=[model_select, dtype, max_model_len, max_num_seqs, tensor_parallel_size, gpu_memory_utilization, trust_remote_code, chat_template, confirm_switch], outputs=[activation_result, dashboard], concurrency_limit=1)
+        activate_button.click(activate_model, inputs=[model_select, dtype, max_model_len, max_num_seqs, tensor_parallel_size, gpu_memory_utilization, trust_remote_code, chat_template, enforce_eager, enable_chunked_prefill, confirm_switch], outputs=[activation_result, dashboard], concurrency_limit=1)
         inspect_button.click(inspect_remote, inputs=repo_id, outputs=remote_summary)
         download_button.click(download_remote, inputs=repo_id, outputs=[download_result, model_select], concurrency_limit=1)
         console_refresh.click(lambda: manager.logs(), outputs=console)

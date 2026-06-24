@@ -100,7 +100,13 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     model = make_model(config)
     manager = VllmServerManager(config, ModelLibrary(config))
 
-    command = manager.build_command(ActiveModel(model_id="org/repo", dtype="fp16", tensor_parallel_size=2))
+    command = manager.build_command(ActiveModel(
+        model_id="org/repo",
+        dtype="fp16",
+        tensor_parallel_size=2,
+        enforce_eager=True,
+        enable_chunked_prefill=True
+    ))
 
     assert command[:3] == [str(config.python_executable), "-m", "vllm.entrypoints.openai.api_server"]
     assert command[command.index("--model") + 1] == str(model)
@@ -108,13 +114,21 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     assert command[command.index("--load-format") + 1] == "safetensors"
     assert command[command.index("--tensor-parallel-size") + 1] == "2"
     assert command[command.index("--api-key") + 1] == "secret"
+    assert "--enforce-eager" in command
+    assert "--enable-chunked-prefill" in command
 
 
 def test_saved_state_round_trip(tmp_path: Path):
     config = make_config(tmp_path)
     make_model(config)
     manager = VllmServerManager(config, ModelLibrary(config))
-    active = ActiveModel(model_id="org/repo", dtype="float32", max_model_len=4096)
+    active = ActiveModel(
+        model_id="org/repo",
+        dtype="float32",
+        max_model_len=4096,
+        enforce_eager=True,
+        enable_chunked_prefill=True
+    )
 
     manager._write_state(active)
 
@@ -123,3 +137,5 @@ def test_saved_state_round_trip(tmp_path: Path):
     assert payload["schema_version"] == 2
     assert "api_key" not in payload
     assert "hf_token" not in payload
+    assert payload["enforce_eager"] is True
+    assert payload["enable_chunked_prefill"] is True
