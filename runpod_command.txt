@@ -5,7 +5,7 @@
 # Optional for gated/private repositories: HF_TOKEN
 # Expose HTTP ports 7860 and 8000. Attach the volume at /workspace.
 
-bash -lc "cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clone --depth 1 https://github.com/Dizzle700/model_runpod.git safetensors-rig-source; else git -C safetensors-rig-source pull --ff-only; fi && exec bash safetensors-rig-source/start_runpod.sh"
+bash -lc "export SAFETENSORS_INSTALL_VLLM=0 SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES=1 SAFETENSORS_UPGRADE_PIP=0; cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clone --depth 1 https://github.com/Dizzle700/runpod_inference_bf16.git safetensors-rig-source; else git -C safetensors-rig-source remote set-url origin https://github.com/Dizzle700/runpod_inference_bf16.git && git -C safetensors-rig-source pull --ff-only; fi && exec bash safetensors-rig-source/start_runpod.sh"
 
 # HTTP Ports:
 7860,8000

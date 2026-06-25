@@ -7,7 +7,7 @@ VOLUME_ROOT="${SAFETENSORS_VOLUME_ROOT:-${GGUF_VOLUME_ROOT:-/workspace}}"
 VENV_DIR="${SAFETENSORS_VENV_DIR:-$VOLUME_ROOT/.venvs/safetensors-rig}"
 PYTHON_EXE="${PYTHON_EXE:-python3}"
 VENV_SYSTEM_SITE_PACKAGES="${SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES:-1}"
-INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-auto}"
+INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-0}"
 UPGRADE_PIP="${SAFETENSORS_UPGRADE_PIP:-0}"
 
 info() { printf '\033[0;34m%s\033[0m\n' "$*"; }
@@ -85,7 +85,7 @@ case "${INSTALL_VLLM,,}" in
 esac
 
 if ! package_available vllm; then
-    error "vLLM is not importable. Use a RunPod vLLM/PyTorch template or set SAFETENSORS_INSTALL_VLLM=1."
+    error "vLLM is not importable. Use a RunPod template with vLLM preinstalled or set SAFETENSORS_INSTALL_VLLM=1 to allow pip install."
     exit 1
 fi
 
