@@ -27,7 +27,9 @@ SAFETENSORS_PANEL_PASSWORD=<сложный пароль>
 HF_TOKEN=<необязательно; нужен для gated/private моделей>
 ```
 
-Команду запуска возьмите из `runpod_command.txt`. Первый запуск создаёт persistent venv и устанавливает vLLM. После успешной установки можно задать `SAFETENSORS_SKIP_INSTALL=1`.
+Команду запуска возьмите из `runpod_command.txt`. Первый запуск создаёт persistent venv. По умолчанию venv создаётся с `--system-site-packages`, поэтому он видит пакеты из RunPod template. Если `vllm` уже есть в template, bootstrap не будет устанавливать его заново и не должен тянуть тяжёлые `nvidia-*` wheels. После успешной установки можно задать `SAFETENSORS_SKIP_INSTALL=1`.
+
+Если используете template без vLLM, оставьте `SAFETENSORS_INSTALL_VLLM=auto` или задайте `SAFETENSORS_INSTALL_VLLM=1`. Если используете template с готовым vLLM/PyTorch/CUDA стеком и хотите запретить установку vLLM через pip, задайте `SAFETENSORS_INSTALL_VLLM=0`; запуск остановится с ошибкой, если `vllm` не импортируется.
 
 ## Работа в панели
 

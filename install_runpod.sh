@@ -6,11 +6,30 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VOLUME_ROOT="${SAFETENSORS_VOLUME_ROOT:-${GGUF_VOLUME_ROOT:-/workspace}}"
 VENV_DIR="${SAFETENSORS_VENV_DIR:-$VOLUME_ROOT/.venvs/safetensors-rig}"
 PYTHON_EXE="${PYTHON_EXE:-python3}"
+VENV_SYSTEM_SITE_PACKAGES="${SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES:-1}"
+INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-auto}"
+UPGRADE_PIP="${SAFETENSORS_UPGRADE_PIP:-0}"
 
 info() { printf '\033[0;34m%s\033[0m\n' "$*"; }
 success() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 error() { printf '\033[0;31m%s\033[0m\n' "$*" >&2; }
 trap 'error "Installation failed at line $LINENO (exit $?)."' ERR
+
+enabled() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+package_available() {
+    "$VENV_DIR/bin/python" - "$1" <<'PY'
+import importlib.util
+import sys
+
+raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+}
 
 if [[ ! -d "$VOLUME_ROOT" ]]; then
     error "Persistent volume root does not exist: $VOLUME_ROOT"
@@ -22,14 +41,53 @@ info "Installing Python/runtime prerequisites..."
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates git python3-venv
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-    info "Creating the persistent Python environment..."
-    "$PYTHON_EXE" -m venv "$VENV_DIR"
+venv_args=("$PYTHON_EXE" -m venv)
+if enabled "$VENV_SYSTEM_SITE_PACKAGES"; then
+    venv_args+=(--system-site-packages)
 fi
 
-info "Installing vLLM and control-panel dependencies..."
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    info "Creating the persistent Python environment..."
+    "${venv_args[@]}" "$VENV_DIR"
+elif enabled "$VENV_SYSTEM_SITE_PACKAGES" && grep -Eiq '^include-system-site-packages *= *false' "$VENV_DIR/pyvenv.cfg"; then
+    info "Reconfiguring the Python environment to see RunPod template packages..."
+    "${venv_args[@]}" "$VENV_DIR"
+fi
+
+if enabled "$UPGRADE_PIP"; then
+    info "Upgrading pip..."
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip
+fi
+
+info "Installing control-panel dependencies..."
 "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+
+case "${INSTALL_VLLM,,}" in
+    auto|"")
+        if package_available vllm; then
+            info "Using existing vLLM from the RunPod template; skipping vLLM install."
+        else
+            info "vLLM is not importable; installing vLLM..."
+            "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements-vllm.txt"
+        fi
+        ;;
+    1|true|yes|on)
+        info "Installing/updating vLLM..."
+        "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements-vllm.txt"
+        ;;
+    0|false|no|off|skip)
+        info "Skipping vLLM installation because SAFETENSORS_INSTALL_VLLM=$INSTALL_VLLM."
+        ;;
+    *)
+        error "Unsupported SAFETENSORS_INSTALL_VLLM value: $INSTALL_VLLM (use auto, 1, or 0)"
+        exit 1
+        ;;
+esac
+
+if ! package_available vllm; then
+    error "vLLM is not importable. Use a RunPod vLLM/PyTorch template or set SAFETENSORS_INSTALL_VLLM=1."
+    exit 1
+fi
 
 mkdir -p \
     "$VOLUME_ROOT/models/safetensors" \
