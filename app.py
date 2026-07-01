@@ -44,6 +44,7 @@ CSS = """
 .rig-hero p { margin: 0; opacity: .72; }
 .rig-status { min-height: 164px; }
 .rig-note { opacity: .78; font-size: .92rem; }
+.active-model-box { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color-primary); background: var(--background-fill-secondary); margin-bottom: 14px; font-size: 0.95rem; }
 footer { display: none !important; }
 """
 
@@ -264,6 +265,10 @@ def chat_stream(
     max_tokens: int,
     top_p: float,
     repetition_penalty: float,
+    top_k: int,
+    presence_penalty: float,
+    frequency_penalty: float,
+    min_p: float,
 ):
     status = manager.status()
     if not status["healthy"]:
@@ -299,6 +304,14 @@ def chat_stream(
     }
     if repetition_penalty != 1.0:
         payload["repetition_penalty"] = repetition_penalty
+    if presence_penalty != 0.0:
+        payload["presence_penalty"] = presence_penalty
+    if frequency_penalty != 0.0:
+        payload["frequency_penalty"] = frequency_penalty
+    if top_k != -1:
+        payload["top_k"] = int(top_k)
+    if min_p != 0.0:
+        payload["min_p"] = min_p
 
     headers = {"Content-Type": "application/json"}
     if config.api_key:
@@ -308,6 +321,7 @@ def chat_stream(
     headers["Content-Length"] = str(len(body))
 
     t0 = time.monotonic()
+    latency = 0.0
     accumulated = ""
     total_tokens = 0
     error_occurred = False
@@ -361,10 +375,31 @@ def chat_stream(
         latency = time.monotonic() - t0
         manager.record_api_call(tokens=total_tokens, latency=latency, error=error_occurred)
 
+    if not error_occurred and total_tokens > 0:
+        speed = total_tokens / latency if latency > 0 else 0.0
+        stats = f"\n\n⚡ *{speed:.1f} tok/s | {total_tokens} tokens | {latency:.2f}s*"
+        accumulated += stats
+
     # Warn if response was truncated.
     if finish_reason == "length":
         accumulated += "\n\n⚠️ *Response truncated (max_tokens reached)*"
-        yield accumulated
+    
+    yield accumulated
+
+
+def active_model_info() -> str:
+    status = manager.status()
+    if status["healthy"] and status["model"]:
+        model_name = status["model"]
+        if status.get("dtype"):
+            model_name += f" ({status['dtype']})"
+        return f"🟢 **Active Model:** `{model_name}`"
+    elif status["healthy"]:
+        return "🟢 **Active Model:** *(starting/ready)*"
+    elif status["running"]:
+        return "🟠 **Active Model:** *(initializing server...)*"
+    else:
+        return "🔴 **Active Model:** `None` *(server stopped)*"
 
 
 def build_app() -> gr.Blocks:
@@ -460,6 +495,7 @@ def build_app() -> gr.Blocks:
                 delete_result = gr.Markdown()
 
             with gr.Tab("Playground"):
+                active_model_box = gr.Markdown(active_model_info(), elem_classes="active-model-box")
                 gr.Markdown("### Chat Playground")
                 with gr.Accordion("Generation settings", open=False):
                     system_prompt = gr.Textbox(
@@ -478,13 +514,36 @@ def build_app() -> gr.Blocks:
                         top_p = gr.Slider(
                             label="Top-p", value=1.0, minimum=0.0, maximum=1.0, step=0.01
                         )
+                        min_p = gr.Slider(
+                            label="Min-p", value=0.0, minimum=0.0, maximum=1.0, step=0.01
+                        )
+                    with gr.Row():
                         repetition_penalty = gr.Slider(
                             label="Repetition penalty", value=1.0, minimum=1.0, maximum=2.0, step=0.01
+                        )
+                        top_k = gr.Slider(
+                            label="Top-k (-1 to disable)", value=-1, minimum=-1, maximum=100, step=1
+                        )
+                    with gr.Row():
+                        presence_penalty = gr.Slider(
+                            label="Presence penalty", value=0.0, minimum=-2.0, maximum=2.0, step=0.05
+                        )
+                        frequency_penalty = gr.Slider(
+                            label="Frequency penalty", value=0.0, minimum=-2.0, maximum=2.0, step=0.05
                         )
                 gr.ChatInterface(
                     fn=chat_stream,
                     type="messages",
-                    additional_inputs=[system_prompt, temperature, max_tokens, top_p, repetition_penalty],
+                    additional_inputs=[
+                        system_prompt, temperature, max_tokens, top_p,
+                        repetition_penalty, top_k, presence_penalty, frequency_penalty, min_p
+                    ],
+                    examples=[
+                        ["Explain quantum computing in simple terms."],
+                        ["Write a Python function to check if a number is prime."],
+                        ["Draft a professional response to a customer complaining about a delayed delivery."],
+                        ["Act as a creative naming assistant and suggest 10 names for a new AI coding tool."],
+                    ],
                 )
 
             with gr.Tab("Console"):
@@ -543,6 +602,7 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         console_refresh.click(lambda: manager.logs(), outputs=console)
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
+        timer.tick(active_model_info, outputs=active_model_box)
         timer.tick(lambda: manager.logs(), outputs=console)
     return demo
 
