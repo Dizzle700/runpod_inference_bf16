@@ -2,14 +2,29 @@
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import os
 import threading
-import urllib.request
+import time
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_VOLUME = Path(os.environ.get("SAFETENSORS_VOLUME_ROOT", os.environ.get("GGUF_VOLUME_ROOT", "/workspace" if Path("/workspace").is_dir() else str(PROJECT_DIR / "data")))).expanduser()
+
+
+def _resolve_default_volume() -> Path:
+    """Determine the default volume root from environment or filesystem."""
+    env_volume = os.environ.get("SAFETENSORS_VOLUME_ROOT") or os.environ.get("GGUF_VOLUME_ROOT")
+    if env_volume:
+        return Path(env_volume).expanduser()
+    if Path("/workspace").is_dir():
+        return Path("/workspace")
+    return PROJECT_DIR / "data"
+
+
+DEFAULT_VOLUME = _resolve_default_volume()
 os.environ.setdefault("HF_HOME", str(DEFAULT_VOLUME / ".hf"))
 os.environ.setdefault("HF_HUB_CACHE", str(DEFAULT_VOLUME / ".hf" / "hub"))
 
@@ -59,16 +74,79 @@ def dashboard_markdown() -> str:
         f"- **Volume:** `{disk['free_gib']:.1f} GiB free` / `{disk['total_gib']:.1f} GiB`",
         f"- **Local API:** `{status['api_url']}`",
     ]
+
+    # Active model parameters.
+    if status["model"]:
+        params = []
+        if status.get("max_model_len"):
+            params.append(f"ctx {status['max_model_len']}")
+        if status.get("tensor_parallel_size") and status["tensor_parallel_size"] > 1:
+            params.append(f"TP={status['tensor_parallel_size']}")
+        if status.get("gpu_memory_utilization"):
+            params.append(f"GPU util {status['gpu_memory_utilization']:.0%}")
+        if status.get("enforce_eager"):
+            params.append("eager")
+        if status.get("enable_chunked_prefill"):
+            params.append("chunked-prefill")
+        if params:
+            lines.append(f"- **Params:** {' · '.join(params)}")
+
+    # Auto-restart indicator.
+    if status.get("auto_restart"):
+        lines.append("- **Auto-restart:** ✅ enabled")
+
+    # GPU info.
     if gpus:
         for gpu in gpus:
-            lines.append(f"- **GPU {gpu['index']}:** {gpu['name']} · {gpu['memory_used_mib']} / {gpu['memory_total_mib']} MiB · {gpu['utilization']}% · {gpu['temperature']}°C")
+            lines.append(
+                f"- **GPU {gpu['index']}:** {gpu['name']} · "
+                f"{gpu['memory_used_mib']} / {gpu['memory_total_mib']} MiB · "
+                f"{gpu['utilization']}% · {gpu['temperature']}°C"
+            )
     else:
         lines.append("- **GPU:** `nvidia-smi unavailable`")
+
+    # vLLM metrics (only when healthy).
+    if status["healthy"]:
+        m = manager.metrics()
+        metric_parts = []
+        if m.get("active_requests") is not None:
+            metric_parts.append(f"active {int(m['active_requests'])}")
+        if m.get("pending_requests") is not None:
+            metric_parts.append(f"pending {int(m['pending_requests'])}")
+        if m.get("kv_cache_usage_percent") is not None:
+            metric_parts.append(f"KV cache {m['kv_cache_usage_percent']:.1%}")
+        if m.get("avg_generation_throughput") is not None:
+            metric_parts.append(f"{m['avg_generation_throughput']:.1f} tok/s")
+        if metric_parts:
+            lines.append(f"- **vLLM:** {' · '.join(metric_parts)}")
+
+    # API statistics.
+    stats = manager.api_stats()
+    if stats["total_requests"] > 0:
+        lines.append(
+            f"- **API stats:** {stats['total_requests']} reqs · "
+            f"{stats['total_tokens']} tokens · "
+            f"avg {stats['avg_latency_s']:.2f}s · "
+            f"{stats['errors']} errors"
+        )
+
+    # Model count.
+    model_count = len(library.scan())
+    lines.append(f"- **Models on volume:** {model_count}")
+
     return "\n".join(lines)
 
 
 def _model_choices() -> list[tuple[str, str]]:
-    return [(f"{record.id} · {record.dtype_label} · {record.shard_count} shard(s) · {record.size_gib:.2f} GiB", record.id) for record in library.scan()]
+    return [
+        (
+            f"{record.id} · {record.dtype_label} · "
+            f"{record.shard_count} shard(s) · {record.size_gib:.2f} GiB",
+            record.id,
+        )
+        for record in library.scan()
+    ]
 
 
 def refresh_library(selected: str | None = None):
@@ -97,7 +175,12 @@ def download_remote(repo_id: str, progress=gr.Progress()):
         def report(value: float, description: str) -> None:
             progress(value, desc=description)
 
-        path = library.download_snapshot(remote.repo_id, token=config.hf_token or None, expected_size=remote.size_bytes, progress=report)
+        path = library.download_snapshot(
+            remote.repo_id,
+            token=config.hf_token or None,
+            expected_size=remote.size_bytes,
+            progress=report,
+        )
         choices = _model_choices()
         model_id = path.relative_to(config.models_dir.resolve()).as_posix()
         return f"✅ Downloaded complete model snapshot to `{path}`", gr.update(choices=choices, value=model_id)
@@ -105,7 +188,37 @@ def download_remote(repo_id: str, progress=gr.Progress()):
         return f"❌ {html.escape(str(exc))}", gr.update()
 
 
-def activate_model(model_id: str | None, dtype: str, max_model_len: float, max_num_seqs: float, tensor_parallel_size: float, gpu_memory_utilization: float, trust_remote_code: bool, chat_template: str, enforce_eager: bool, enable_chunked_prefill: bool, confirm_switch: bool):
+def delete_model(model_id: str | None, confirm_delete: bool):
+    if not model_id:
+        return "❌ Select a model to delete.", gr.update(), dashboard_markdown()
+    if not confirm_delete:
+        return "⚠️ Check the deletion confirmation box.", gr.update(), dashboard_markdown()
+    # Prevent deleting the currently active model.
+    status = manager.status()
+    if status["running"] and status["model"] == model_id:
+        return "❌ Cannot delete the currently active model. Stop or switch first.", gr.update(), dashboard_markdown()
+    try:
+        result = library.delete(model_id)
+        choices = _model_choices()
+        new_value = choices[0][1] if choices else None
+        return f"✅ {result}", gr.update(choices=choices, value=new_value), dashboard_markdown()
+    except Exception as exc:
+        return f"❌ {html.escape(str(exc))}", gr.update(), dashboard_markdown()
+
+
+def activate_model(
+    model_id: str | None,
+    dtype: str,
+    max_model_len: float,
+    max_num_seqs: float,
+    tensor_parallel_size: float,
+    gpu_memory_utilization: float,
+    trust_remote_code: bool,
+    chat_template: str,
+    enforce_eager: bool,
+    enable_chunked_prefill: bool,
+    confirm_switch: bool,
+):
     if not model_id:
         return "❌ Select a downloaded model.", dashboard_markdown()
     current = manager.status()
@@ -143,77 +256,127 @@ def stop_server():
         return f"❌ {html.escape(str(exc))}", dashboard_markdown()
 
 
-def chat_stream(message: str, history: list[dict] | list[Any]):
+def chat_stream(
+    message: str,
+    history: list[dict[str, Any]],
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    repetition_penalty: float,
+):
     status = manager.status()
     if not status["healthy"]:
         yield "❌ Server is not ready or stopped. Please activate a model first."
         return
 
-    messages = []
+    messages: list[dict[str, str]] = []
+
+    # Add system prompt if provided.
+    system_prompt = (system_prompt or "").strip()
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
     for h in history:
         if isinstance(h, dict):
-            messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
         else:
-            messages.append({"role": h.role, "content": h.content})
+            messages.append({"role": getattr(h, "role", "user"), "content": getattr(h, "content", "")})
     messages.append({"role": "user", "content": message})
 
-    url = f"{config.local_api_url}/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
+    model_name = manager.served_model_name()
+    parsed_url = urlparse(config.local_api_url)
+    host = parsed_url.hostname or "127.0.0.1"
+    port = parsed_url.port or config.api_port
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "stream": True,
+        "temperature": temperature,
+        "max_tokens": int(max_tokens),
+        "top_p": top_p,
     }
+    if repetition_penalty != 1.0:
+        payload["repetition_penalty"] = repetition_penalty
+
+    headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
 
-    data = {
-        "model": "current",
-        "messages": messages,
-        "stream": True,
-    }
+    body = json.dumps(payload).encode("utf-8")
+    headers["Content-Length"] = str(len(body))
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode("utf-8"),
-        headers=headers,
-        method="POST"
-    )
+    t0 = time.monotonic()
+    accumulated = ""
+    total_tokens = 0
+    error_occurred = False
+    finish_reason = None
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            buffer = ""
-            accumulated = ""
-            for chunk in response:
-                decoded = chunk.decode("utf-8")
-                buffer += decoded
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            payload = json.loads(data_str)
-                            choice = payload.get("choices", [{}])[0]
-                            delta = choice.get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                accumulated += content
-                                yield accumulated
-                        except Exception:
-                            pass
-    except urllib.error.HTTPError as e:
-        yield f"❌ HTTP Error {e.code}: {e.reason}"
+        conn = http.client.HTTPConnection(host, port, timeout=120)
+        conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
+        response = conn.getresponse()
+
+        if response.status != 200:
+            error_msg = response.read().decode(errors="replace")
+            error_occurred = True
+            yield f"❌ HTTP {response.status}: {error_msg[:500]}"
+            return
+
+        buffer = ""
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data_str)
+                        choice = event.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        content = delta.get("content", "")
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        if content:
+                            accumulated += content
+                            total_tokens += 1  # Approximate token count.
+                            yield accumulated
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
+        conn.close()
     except Exception as e:
+        error_occurred = True
         yield f"❌ Error: {e}"
+        return
+    finally:
+        latency = time.monotonic() - t0
+        manager.record_api_call(tokens=total_tokens, latency=latency, error=error_occurred)
+
+    # Warn if response was truncated.
+    if finish_reason == "length":
+        accumulated += "\n\n⚠️ *Response truncated (max_tokens reached)*"
+        yield accumulated
 
 
 def build_app() -> gr.Blocks:
     choices = _model_choices()
     initial_model = choices[0][1] if choices else None
     with gr.Blocks(title="Safetensors Inference Rig", css=CSS, theme=gr.themes.Base()) as demo:
-        gr.HTML("<div class='rig-hero'><h1>Safetensors Inference Rig</h1><p>BF16 · FP16 · FP32 · vLLM · OpenAI-compatible API</p></div>")
+        gr.HTML(
+            "<div class='rig-hero'>"
+            "<h1>Safetensors Inference Rig</h1>"
+            "<p>BF16 · FP16 · FP32 · vLLM · OpenAI-compatible API</p>"
+            "</div>"
+        )
         with gr.Tabs():
             with gr.Tab("Dashboard"):
                 dashboard = gr.Markdown(dashboard_markdown(), elem_classes="rig-status")
@@ -225,42 +388,103 @@ def build_app() -> gr.Blocks:
 
             with gr.Tab("Model Library"):
                 with gr.Row():
-                    model_select = gr.Dropdown(label="Safetensors models on persistent volume", choices=choices, value=initial_model, filterable=True, scale=3)
+                    model_select = gr.Dropdown(
+                        label="Safetensors models on persistent volume",
+                        choices=choices,
+                        value=initial_model,
+                        filterable=True,
+                        scale=3,
+                    )
                     refresh_models = gr.Button("Rescan volume", scale=1)
                 with gr.Accordion("Run configuration", open=True):
                     dtype = gr.Dropdown(
                         label="Compute dtype",
-                        choices=[("BF16 (recommended on Ampere+)", "bfloat16"), ("FP16", "float16"), ("FP32 (very high VRAM use)", "float32")],
+                        choices=[
+                            ("BF16 (recommended on Ampere+)", "bfloat16"),
+                            ("FP16", "float16"),
+                            ("FP32 (very high VRAM use)", "float32"),
+                        ],
                         value="bfloat16",
                     )
                     with gr.Row():
                         max_model_len = gr.Number(label="Max model length", value=8192, precision=0, minimum=512)
                         max_num_seqs = gr.Number(label="Max concurrent sequences", value=64, precision=0, minimum=1)
                         tensor_parallel_size = gr.Number(label="Tensor parallel GPUs", value=1, precision=0, minimum=1)
-                        gpu_memory_utilization = gr.Slider(label="GPU memory utilization", value=0.90, minimum=0.05, maximum=1.0, step=0.01)
+                        gpu_memory_utilization = gr.Slider(
+                            label="GPU memory utilization", value=0.90, minimum=0.05, maximum=1.0, step=0.01
+                        )
                     with gr.Row():
-                        trust_remote_code = gr.Checkbox(label="Trust repository remote code (enable only for repositories you trust)")
-                        enforce_eager = gr.Checkbox(label="Enforce eager mode (skip CUDA graphs, saves VRAM & speeds up startup)")
-                        enable_chunked_prefill = gr.Checkbox(label="Enable chunked prefill (helps prevent OOM on long contexts)")
+                        trust_remote_code = gr.Checkbox(
+                            label="Trust repository remote code (enable only for repositories you trust)"
+                        )
+                        enforce_eager = gr.Checkbox(
+                            label="Enforce eager mode (skip CUDA graphs, saves VRAM & speeds up startup)"
+                        )
+                        enable_chunked_prefill = gr.Checkbox(
+                            label="Enable chunked prefill (helps prevent OOM on long contexts)"
+                        )
                     chat_template = gr.Textbox(label="Chat-template override (normally empty)", lines=3)
                 confirm_switch = gr.Checkbox(label="I understand that switching can interrupt in-flight requests")
                 activate_button = gr.Button("Activate model", variant="primary")
                 activation_result = gr.Markdown()
 
+                gr.Markdown("---")
+
                 gr.Markdown("### Download from Hugging Face")
-                gr.Markdown("Downloads the complete model snapshot: Safetensors weights, config, tokenizer and model code. Alternative `.bin`, GGUF and ONNX weights are skipped.", elem_classes="rig-note")
-                repo_id = gr.Textbox(label="Repository", placeholder="organization/repository or https://huggingface.co/organization/repository")
+                gr.Markdown(
+                    "Downloads the complete model snapshot: Safetensors weights, config, tokenizer and model code. "
+                    "Alternative `.bin`, GGUF and ONNX weights are skipped.",
+                    elem_classes="rig-note",
+                )
+                repo_id = gr.Textbox(
+                    label="Repository",
+                    placeholder="organization/repository or https://huggingface.co/organization/repository",
+                )
                 with gr.Row():
                     inspect_button = gr.Button("Inspect repository")
                     download_button = gr.Button("Download snapshot", variant="primary")
                 remote_summary = gr.Markdown()
                 download_result = gr.Markdown()
 
+                gr.Markdown("---")
+
+                gr.Markdown("### Delete Model")
+                gr.Markdown(
+                    "Permanently removes a downloaded model from the persistent volume.",
+                    elem_classes="rig-note",
+                )
+                confirm_delete = gr.Checkbox(
+                    label="I understand this permanently deletes the model files and cannot be undone"
+                )
+                delete_button = gr.Button("Delete selected model", variant="stop")
+                delete_result = gr.Markdown()
+
             with gr.Tab("Playground"):
                 gr.Markdown("### Chat Playground")
+                with gr.Accordion("Generation settings", open=False):
+                    system_prompt = gr.Textbox(
+                        label="System prompt",
+                        placeholder="You are a helpful assistant...",
+                        lines=2,
+                    )
+                    with gr.Row():
+                        temperature = gr.Slider(
+                            label="Temperature", value=0.7, minimum=0.0, maximum=2.0, step=0.05
+                        )
+                        max_tokens = gr.Slider(
+                            label="Max tokens", value=2048, minimum=1, maximum=16384, step=1
+                        )
+                    with gr.Row():
+                        top_p = gr.Slider(
+                            label="Top-p", value=1.0, minimum=0.0, maximum=1.0, step=0.01
+                        )
+                        repetition_penalty = gr.Slider(
+                            label="Repetition penalty", value=1.0, minimum=1.0, maximum=2.0, step=0.01
+                        )
                 gr.ChatInterface(
                     fn=chat_stream,
                     type="messages",
+                    additional_inputs=[system_prompt, temperature, max_tokens, top_p, repetition_penalty],
                 )
 
             with gr.Tab("Console"):
@@ -279,16 +503,43 @@ def build_app() -> gr.Blocks:
 - Panel authentication: **{"configured" if config.panel_user and config.panel_password else "missing"}**
 - Hugging Face token: **{"configured" if config.hf_token else "not configured"}**
 
+### Process Management
+
+- Auto-restart on crash: **{"enabled" if config.auto_restart else "disabled"}** (`SAFETENSORS_AUTO_RESTART`)
+- Auto-restart max retries: **{config.auto_restart_max_retries}** (`SAFETENSORS_AUTO_RESTART_MAX_RETRIES`)
+- Max log file size: **{config.max_log_bytes / 1024 / 1024:.0f} MB** (`SAFETENSORS_MAX_LOG_BYTES`)
+- Health check timeout: **{config.health_timeout}s** (`SAFETENSORS_HEALTH_TIMEOUT`)
+- Stop timeout: **{config.stop_timeout}s** (`SAFETENSORS_STOP_TIMEOUT`)
+
 Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
                 """)
+
+        # -- Event wiring --------------------------------------------------
 
         refresh_dashboard.click(dashboard_markdown, outputs=dashboard)
         restart_button.click(restart_server, outputs=[dashboard_message, dashboard])
         stop_button.click(stop_server, outputs=[dashboard_message, dashboard])
         refresh_models.click(refresh_library, inputs=model_select, outputs=[model_select, dashboard])
-        activate_button.click(activate_model, inputs=[model_select, dtype, max_model_len, max_num_seqs, tensor_parallel_size, gpu_memory_utilization, trust_remote_code, chat_template, enforce_eager, enable_chunked_prefill, confirm_switch], outputs=[activation_result, dashboard], concurrency_limit=1)
+        activate_button.click(
+            activate_model,
+            inputs=[
+                model_select, dtype, max_model_len, max_num_seqs,
+                tensor_parallel_size, gpu_memory_utilization, trust_remote_code,
+                chat_template, enforce_eager, enable_chunked_prefill, confirm_switch,
+            ],
+            outputs=[activation_result, dashboard],
+            concurrency_limit=1,
+        )
         inspect_button.click(inspect_remote, inputs=repo_id, outputs=remote_summary)
-        download_button.click(download_remote, inputs=repo_id, outputs=[download_result, model_select], concurrency_limit=1)
+        download_button.click(
+            download_remote, inputs=repo_id, outputs=[download_result, model_select], concurrency_limit=1
+        )
+        delete_button.click(
+            delete_model,
+            inputs=[model_select, confirm_delete],
+            outputs=[delete_result, model_select, dashboard],
+            concurrency_limit=1,
+        )
         console_refresh.click(lambda: manager.logs(), outputs=console)
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
@@ -321,10 +572,23 @@ def main() -> None:
     demo = build_app()
     threading.Thread(target=_restore_in_background, daemon=True).start()
     auth = (config.panel_user, config.panel_password) if config.panel_user and config.panel_password else None
-    port = find_free_port(config.panel_host, config.panel_port)
-    if port != config.panel_port:
-        print(f"⚠️ Port {config.panel_port} was busy. Switched to {port}.")
-    demo.queue(default_concurrency_limit=4).launch(server_name=config.panel_host, server_port=port, auth=auth, show_error=True)
+
+    # Retry port binding up to 3 times to reduce TOCTOU race window.
+    last_error = None
+    for attempt in range(3):
+        port = find_free_port(config.panel_host, config.panel_port)
+        if port != config.panel_port:
+            print(f"⚠️ Port {config.panel_port} was busy. Switched to {port}.")
+        try:
+            demo.queue(default_concurrency_limit=4).launch(
+                server_name=config.panel_host, server_port=port, auth=auth, show_error=True
+            )
+            return
+        except OSError as exc:
+            last_error = exc
+            print(f"⚠️ Port {port} became unavailable (attempt {attempt + 1}/3), retrying...")
+            time.sleep(0.5)
+    raise RuntimeError(f"Failed to bind to any port after 3 attempts: {last_error}")
 
 
 if __name__ == "__main__":

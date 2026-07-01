@@ -10,8 +10,9 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-TEMPLATE_FILE="runpod_variables.template.env"
-TARGET_FILE="runpod_variables.env"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_FILE="$SCRIPT_DIR/runpod_variables.template.env"
+TARGET_FILE="$SCRIPT_DIR/runpod_variables.env"
 
 echo -e "${BLUE}=== Safetensors RunPod Environment Generator ===${NC}"
 
@@ -37,28 +38,33 @@ echo -e "${BLUE}Generating secure API keys and passwords...${NC}"
 # Use openssl if available, fallback to python
 if command -v openssl >/dev/null 2>&1; then
     API_KEY=$(openssl rand -hex 32)
-    PANEL_PASS=$(openssl rand -base64 15 | tr -d '/+=') # Keep it clean and URL/shell safe
+    PANEL_PASS=$(openssl rand -hex 12)
 else
     API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-    PANEL_PASS=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)))")
+    PANEL_PASS=$(python3 -c "import secrets; print(secrets.token_hex(12))")
 fi
 
 PANEL_USER="admin"
 
 echo -e "${GREEN}API Key and Password successfully generated.${NC}"
 
-# Create runpod_variables.env by replacing placeholders
-python3 -c "
-with open('$TEMPLATE_FILE', 'r') as f:
+# Create runpod_variables.env by replacing placeholders.
+# Pass values as arguments to Python to avoid shell injection issues.
+python3 - "$TEMPLATE_FILE" "$TARGET_FILE" "$API_KEY" "$PANEL_USER" "$PANEL_PASS" <<'PY'
+import sys
+
+template_path, target_path, api_key, panel_user, panel_pass = sys.argv[1:6]
+
+with open(template_path, 'r') as f:
     content = f.read()
 
-content = content.replace('CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32', '$API_KEY')
-content = content.replace('CHANGE_ME_PANEL_USER', '$PANEL_USER')
-content = content.replace('CHANGE_ME_STRONG_PANEL_PASSWORD', '$PANEL_PASS')
+content = content.replace('CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32', api_key)
+content = content.replace('CHANGE_ME_PANEL_USER', panel_user)
+content = content.replace('CHANGE_ME_STRONG_PANEL_PASSWORD', panel_pass)
 
-with open('$TARGET_FILE', 'w') as f:
+with open(target_path, 'w') as f:
     f.write(content)
-"
+PY
 
 echo -e "${GREEN}Successfully created '$TARGET_FILE'!${NC}"
 echo -e "----------------------------------------"

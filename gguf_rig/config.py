@@ -35,6 +35,9 @@ class RigConfig:
     allow_insecure: bool
     health_timeout: int
     stop_timeout: int
+    auto_restart: bool = False
+    auto_restart_max_retries: int = 3
+    max_log_bytes: int = 50 * 1024 * 1024  # 50 MB
 
     @classmethod
     def from_env(cls) -> "RigConfig":
@@ -58,6 +61,9 @@ class RigConfig:
             allow_insecure=_env_bool("SAFETENSORS_ALLOW_INSECURE", "GGUF_ALLOW_INSECURE"),
             health_timeout=int(_env("SAFETENSORS_HEALTH_TIMEOUT", "GGUF_HEALTH_TIMEOUT", "600")),
             stop_timeout=int(_env("SAFETENSORS_STOP_TIMEOUT", "GGUF_STOP_TIMEOUT", "30")),
+            auto_restart=_env_bool("SAFETENSORS_AUTO_RESTART"),
+            auto_restart_max_retries=int(os.environ.get("SAFETENSORS_AUTO_RESTART_MAX_RETRIES", "3")),
+            max_log_bytes=int(os.environ.get("SAFETENSORS_MAX_LOG_BYTES", str(50 * 1024 * 1024))),
         )
 
     @property

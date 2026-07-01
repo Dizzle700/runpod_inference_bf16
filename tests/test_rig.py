@@ -28,6 +28,9 @@ def make_config(tmp_path: Path, **overrides) -> RigConfig:
         allow_insecure=False,
         health_timeout=1,
         stop_timeout=1,
+        auto_restart=False,
+        auto_restart_max_retries=3,
+        max_log_bytes=50 * 1024 * 1024,
     )
     values.update(overrides)
     return RigConfig(**values)
@@ -78,6 +81,31 @@ def test_library_rejects_path_escape(tmp_path: Path):
     library = ModelLibrary(make_config(tmp_path))
     with pytest.raises(ValueError, match="escapes"):
         library.get("../outside")
+
+
+def test_library_delete_model(tmp_path: Path):
+    config = make_config(tmp_path)
+    make_model(config)
+    lib = ModelLibrary(config)
+
+    assert len(lib.scan()) == 1
+    result = lib.delete("org/repo")
+    assert "Deleted" in result
+    assert len(lib.scan()) == 0
+    # Parent org/ directory should also be cleaned up.
+    assert not (config.models_dir / "org").exists()
+
+
+def test_library_delete_rejects_path_escape(tmp_path: Path):
+    library = ModelLibrary(make_config(tmp_path))
+    with pytest.raises(ValueError, match="escapes"):
+        library.delete("../outside")
+
+
+def test_library_delete_nonexistent(tmp_path: Path):
+    library = ModelLibrary(make_config(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        library.delete("org/nonexistent")
 
 
 def test_remote_repo_validation():
@@ -139,3 +167,81 @@ def test_saved_state_round_trip(tmp_path: Path):
     assert "hf_token" not in payload
     assert payload["enforce_eager"] is True
     assert payload["enable_chunked_prefill"] is True
+
+
+def test_config_new_fields_defaults(tmp_path: Path):
+    config = make_config(tmp_path)
+    assert config.auto_restart is False
+    assert config.auto_restart_max_retries == 3
+    assert config.max_log_bytes == 50 * 1024 * 1024
+
+
+def test_config_new_fields_custom(tmp_path: Path):
+    config = make_config(tmp_path, auto_restart=True, auto_restart_max_retries=5, max_log_bytes=100 * 1024 * 1024)
+    assert config.auto_restart is True
+    assert config.auto_restart_max_retries == 5
+    assert config.max_log_bytes == 100 * 1024 * 1024
+
+
+def test_api_stats(tmp_path: Path):
+    config = make_config(tmp_path)
+    manager = VllmServerManager(config, ModelLibrary(config))
+
+    assert manager.api_stats()["total_requests"] == 0
+    manager.record_api_call(tokens=10, latency=0.5, error=False)
+    manager.record_api_call(tokens=20, latency=1.5, error=True)
+
+    stats = manager.api_stats()
+    assert stats["total_requests"] == 2
+    assert stats["total_tokens"] == 30
+    assert stats["errors"] == 1
+    assert stats["avg_latency_s"] == 1.0
+
+
+def test_status_includes_model_params(tmp_path: Path):
+    config = make_config(tmp_path)
+    manager = VllmServerManager(config, ModelLibrary(config))
+
+    status = manager.status()
+    # When no model is active, extended params are None.
+    assert status["max_model_len"] is None
+    assert status["auto_restart"] is False
+
+
+def test_log_rotation(tmp_path: Path):
+    config = make_config(tmp_path, max_log_bytes=100)
+    config.ensure_directories()
+    manager = VllmServerManager(config, ModelLibrary(config))
+
+    # Create a log file exceeding the limit.
+    config.server_log_file.write_text("x" * 200)
+    assert config.server_log_file.stat().st_size > 100
+
+    manager._rotate_log_if_needed()
+
+    # Original should be gone, rotated file should exist.
+    assert not config.server_log_file.exists()
+    rotated = config.server_log_file.with_suffix(".log.1")
+    assert rotated.exists()
+    assert rotated.stat().st_size == 200
+
+
+def test_prometheus_parser():
+    from gguf_rig.process_manager import _parse_prometheus_simple
+
+    text = """
+# HELP vllm_num_requests_running Number of running requests
+# TYPE vllm_num_requests_running gauge
+vllm_num_requests_running 3
+vllm_num_requests_waiting 1
+vllm_gpu_cache_usage_perc 0.45
+vllm_avg_generation_throughput_toks_per_s 120.5
+# Some labeled metric we skip
+vllm_request_duration{method="POST"} 0.123
+"""
+    result = _parse_prometheus_simple(text)
+    assert result["vllm_num_requests_running"] == 3.0
+    assert result["vllm_num_requests_waiting"] == 1.0
+    assert result["vllm_gpu_cache_usage_perc"] == 0.45
+    assert result["vllm_avg_generation_throughput_toks_per_s"] == 120.5
+    assert "vllm_request_duration" not in result  # Labeled lines are skipped.

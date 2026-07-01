@@ -1,3 +1,8 @@
+# ========================================================
+# RunPod Docker Command
+# ========================================================
+# Paste this as the "Docker Command" in RunPod pod configuration.
+#
 # Required RunPod Secrets / Environment Variables:
 #   SAFETENSORS_API_KEY        Bearer token for the OpenAI-compatible API
 #   SAFETENSORS_PANEL_USER     Basic-auth username for Gradio
@@ -5,11 +10,23 @@
 # Optional for gated/private repositories: HF_TOKEN
 # Expose HTTP ports 7860 and 8000. Attach the volume at /workspace.
 
-bash -lc "export SAFETENSORS_INSTALL_VLLM=0 SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES=1 SAFETENSORS_UPGRADE_PIP=0; cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clone --depth 1 https://github.com/Dizzle700/runpod_inference_bf16.git safetensors-rig-source; else git -C safetensors-rig-source remote set-url origin https://github.com/Dizzle700/runpod_inference_bf16.git && git -C safetensors-rig-source pull --ff-only; fi && exec bash safetensors-rig-source/start_runpod.sh"
+bash -lc "export SAFETENSORS_INSTALL_VLLM=auto SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES=1 SAFETENSORS_UPGRADE_PIP=0; cd /workspace && if [ ! -d safetensors-rig-source/.git ]; then git clone --depth 1 https://github.com/Dizzle700/runpod_inference_bf16.git safetensors-rig-source; else git -C safetensors-rig-source remote set-url origin https://github.com/Dizzle700/runpod_inference_bf16.git && git -C safetensors-rig-source pull --ff-only; fi && exec bash safetensors-rig-source/start_runpod.sh"
 
 # HTTP Ports:
 7860,8000
 
 
-cd runpod_inference_bf16
-bash generate_env.sh
+# ========================================================
+# Local Development
+# ========================================================
+# These commands are for local development only, not for RunPod.
+#
+# 1. Generate environment variables:
+#      cd runpod_inference_bf16
+#      bash generate_env.sh
+#
+# 2. Run with insecure mode for localhost:
+#      SAFETENSORS_ALLOW_INSECURE=1 \
+#      SAFETENSORS_API_HOST=127.0.0.1 \
+#      SAFETENSORS_PANEL_HOST=127.0.0.1 \
+#      python app.py

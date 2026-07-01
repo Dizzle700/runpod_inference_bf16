@@ -7,7 +7,9 @@ VOLUME_ROOT="${SAFETENSORS_VOLUME_ROOT:-${GGUF_VOLUME_ROOT:-/workspace}}"
 VENV_DIR="${SAFETENSORS_VENV_DIR:-$VOLUME_ROOT/.venvs/safetensors-rig}"
 PYTHON_EXE="${PYTHON_EXE:-python3}"
 VENV_SYSTEM_SITE_PACKAGES="${SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES:-1}"
-INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-0}"
+INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-auto}"
+EXPECTED_VLLM_VERSION="${SAFETENSORS_EXPECTED_VLLM_VERSION:-0.11.0}"
+VLLM_CONSTRAINTS="${SAFETENSORS_VLLM_CONSTRAINTS:-$SCRIPT_DIR/constraints-vllm-torch280.txt}"
 UPGRADE_PIP="${SAFETENSORS_UPGRADE_PIP:-0}"
 
 info() { printf '\033[0;34m%s\033[0m\n' "$*"; }
@@ -28,6 +30,28 @@ import importlib.util
 import sys
 
 raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+}
+
+install_vllm() {
+    local pip_args=(-r "$SCRIPT_DIR/requirements-vllm.txt")
+    if [[ -f "$VLLM_CONSTRAINTS" ]]; then
+        pip_args=(-c "$VLLM_CONSTRAINTS" "${pip_args[@]}")
+    fi
+    "$VENV_DIR/bin/python" -m pip install "${pip_args[@]}"
+}
+
+vllm_expected_version() {
+    "$VENV_DIR/bin/python" - "$EXPECTED_VLLM_VERSION" <<'PY'
+import importlib.metadata
+import sys
+
+try:
+    installed = importlib.metadata.version("vllm")
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(1)
+
+raise SystemExit(0 if installed == sys.argv[1] else 1)
 PY
 }
 
@@ -64,16 +88,16 @@ info "Installing control-panel dependencies..."
 
 case "${INSTALL_VLLM,,}" in
     auto|"")
-        if package_available vllm; then
-            info "Using existing vLLM from the RunPod template; skipping vLLM install."
+        if vllm_expected_version; then
+            info "Using existing vLLM $EXPECTED_VLLM_VERSION; skipping vLLM install."
         else
-            info "vLLM is not importable; installing vLLM..."
-            "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements-vllm.txt"
+            info "vLLM $EXPECTED_VLLM_VERSION is not installed; installing pinned vLLM..."
+            install_vllm
         fi
         ;;
     1|true|yes|on)
         info "Installing/updating vLLM..."
-        "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements-vllm.txt"
+        install_vllm
         ;;
     0|false|no|off|skip)
         info "Skipping vLLM installation because SAFETENSORS_INSTALL_VLLM=$INSTALL_VLLM."
@@ -85,7 +109,7 @@ case "${INSTALL_VLLM,,}" in
 esac
 
 if ! package_available vllm; then
-    error "vLLM is not importable. Use a RunPod template with vLLM preinstalled or set SAFETENSORS_INSTALL_VLLM=1 to allow pip install."
+    error "vLLM is not importable. Set SAFETENSORS_INSTALL_VLLM=1/auto or use a RunPod template with vLLM preinstalled."
     exit 1
 fi
 

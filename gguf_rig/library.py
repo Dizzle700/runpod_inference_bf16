@@ -15,6 +15,9 @@ REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
 DTYPE_NAMES = {"BF16": "bf16", "F16": "fp16", "F32": "fp32"}
 IGNORED_WEIGHT_PATTERNS = ["*.bin", "*.pt", "*.pth", "*.ckpt", "*.h5", "*.msgpack", "*.onnx", "*.gguf"]
 
+# Safetensors header limit: 10 MB is generous; legitimate headers are typically < 2 MB.
+_MAX_HEADER_BYTES = 10 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class ModelRecord:
@@ -53,7 +56,7 @@ def _read_safetensors_dtypes(path: Path) -> set[str]:
             if len(raw_length) != 8:
                 return set()
             header_length = int.from_bytes(raw_length, "little")
-            if not 2 <= header_length <= 128 * 1024**2:
+            if not 2 <= header_length <= _MAX_HEADER_BYTES:
                 return set()
             header = json.loads(handle.read(header_length))
         return {
@@ -150,7 +153,31 @@ class ModelLibrary:
         dtypes: set[str] = set()
         for shard in shards:
             dtypes.update(_read_safetensors_dtypes(shard))
-        return ModelRecord(model_dir.relative_to(self.config.models_dir.resolve()).as_posix(), model_dir, sum(p.stat().st_size for p in shards), tuple(sorted(dtypes)), len(shards))
+        return ModelRecord(
+            model_dir.relative_to(self.config.models_dir.resolve()).as_posix(),
+            model_dir,
+            sum(p.stat().st_size for p in shards),
+            tuple(sorted(dtypes)),
+            len(shards),
+        )
+
+    def delete(self, model_id: str) -> str:
+        """Delete a downloaded model from the persistent volume."""
+        model_dir = self._safe_local_path(self.config.models_dir / model_id)
+        if not model_dir.is_dir():
+            raise FileNotFoundError(f"Model not found: {model_id}")
+        size_bytes = sum(f.stat().st_size for f in model_dir.rglob("*") if f.is_file())
+        size_gib = size_bytes / 1024**3
+        shutil.rmtree(model_dir)
+        # Clean up empty parent directories (e.g. org/ after deleting org/repo).
+        for parent in model_dir.parents:
+            if parent == self.config.models_dir.resolve() or parent == self.config.models_dir:
+                break
+            try:
+                parent.rmdir()  # Only succeeds if empty.
+            except OSError:
+                break
+        return f"Deleted {model_id} ({size_gib:.2f} GiB freed)"
 
     def inspect_remote(self, repo_id: str, token: str | None = None) -> RemoteModel:
         repo_id = self.validate_repo_id(repo_id)
