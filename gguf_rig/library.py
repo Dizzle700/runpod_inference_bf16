@@ -268,7 +268,7 @@ class ModelLibrary:
                     if hasattr(mod, "tqdm"):
                         self.originals[(mod, "tqdm")] = getattr(mod, "tqdm")
                         setattr(mod, "tqdm", self.wrapper)
-                for name, module in list(sys.modules).items():
+                for name, module in list(sys.modules.items()):
                     if name.startswith("huggingface_hub") and module:
                         for attr in ("tqdm", "tqdm_auto"):
                             if hasattr(module, attr):
