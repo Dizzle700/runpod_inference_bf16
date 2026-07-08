@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import html
-import http.client
 import json
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -31,6 +29,7 @@ os.environ.setdefault("HF_HUB_CACHE", str(DEFAULT_VOLUME / ".hf" / "hub"))
 import gradio as gr  # noqa: E402
 
 from gguf_rig import ActiveModel, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
+from gguf_rig.chat_client import ChatClient  # noqa: E402
 from gguf_rig.system import disk_stats, gpu_stats  # noqa: E402
 
 
@@ -52,6 +51,7 @@ config = RigConfig.from_env()
 config.ensure_directories()
 library = ModelLibrary(config)
 manager = VllmServerManager(config, library)
+chat_client = ChatClient(config, manager)
 
 
 def _format_uptime(seconds: int) -> str:
@@ -257,134 +257,6 @@ def stop_server():
         return f"❌ {html.escape(str(exc))}", dashboard_markdown()
 
 
-def chat_stream(
-    message: str,
-    history: list[dict[str, Any]],
-    system_prompt: str,
-    temperature: float,
-    max_tokens: int,
-    top_p: float,
-    repetition_penalty: float,
-    top_k: int,
-    presence_penalty: float,
-    frequency_penalty: float,
-    min_p: float,
-):
-    status = manager.status()
-    if not status["healthy"]:
-        yield "❌ Server is not ready or stopped. Please activate a model first."
-        return
-
-    messages: list[dict[str, str]] = []
-
-    # Add system prompt if provided.
-    system_prompt = (system_prompt or "").strip()
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
-    for h in history:
-        if isinstance(h, dict):
-            messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
-        else:
-            messages.append({"role": getattr(h, "role", "user"), "content": getattr(h, "content", "")})
-    messages.append({"role": "user", "content": message})
-
-    model_name = manager.served_model_name()
-    parsed_url = urlparse(config.local_api_url)
-    host = parsed_url.hostname or "127.0.0.1"
-    port = parsed_url.port or config.api_port
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "stream": True,
-        "temperature": temperature,
-        "max_tokens": int(max_tokens),
-        "top_p": top_p,
-    }
-    if repetition_penalty != 1.0:
-        payload["repetition_penalty"] = repetition_penalty
-    if presence_penalty != 0.0:
-        payload["presence_penalty"] = presence_penalty
-    if frequency_penalty != 0.0:
-        payload["frequency_penalty"] = frequency_penalty
-    if top_k != -1:
-        payload["top_k"] = int(top_k)
-    if min_p != 0.0:
-        payload["min_p"] = min_p
-
-    headers = {"Content-Type": "application/json"}
-    if config.api_key:
-        headers["Authorization"] = f"Bearer {config.api_key}"
-
-    body = json.dumps(payload).encode("utf-8")
-    headers["Content-Length"] = str(len(body))
-
-    t0 = time.monotonic()
-    latency = 0.0
-    accumulated = ""
-    total_tokens = 0
-    error_occurred = False
-    finish_reason = None
-
-    try:
-        conn = http.client.HTTPConnection(host, port, timeout=120)
-        conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
-        response = conn.getresponse()
-
-        if response.status != 200:
-            error_msg = response.read().decode(errors="replace")
-            error_occurred = True
-            yield f"❌ HTTP {response.status}: {error_msg[:500]}"
-            return
-
-        buffer = ""
-        while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8", errors="replace")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data_str)
-                        choice = event.get("choices", [{}])[0]
-                        delta = choice.get("delta", {})
-                        content = delta.get("content", "")
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
-                        if content:
-                            accumulated += content
-                            total_tokens += 1  # Approximate token count.
-                            yield accumulated
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
-        conn.close()
-    except Exception as e:
-        error_occurred = True
-        yield f"❌ Error: {e}"
-        return
-    finally:
-        latency = time.monotonic() - t0
-        manager.record_api_call(tokens=total_tokens, latency=latency, error=error_occurred)
-
-    if not error_occurred and total_tokens > 0:
-        speed = total_tokens / latency if latency > 0 else 0.0
-        stats = f"\n\n⚡ *{speed:.1f} tok/s | {total_tokens} tokens | {latency:.2f}s*"
-        accumulated += stats
-
-    # Warn if response was truncated.
-    if finish_reason == "length":
-        accumulated += "\n\n⚠️ *Response truncated (max_tokens reached)*"
-    
-    yield accumulated
 
 
 def active_model_info() -> str:
@@ -532,7 +404,7 @@ def build_app() -> gr.Blocks:
                             label="Frequency penalty", value=0.0, minimum=-2.0, maximum=2.0, step=0.05
                         )
                 gr.ChatInterface(
-                    fn=chat_stream,
+                    fn=chat_client.stream,
                     type="messages",
                     additional_inputs=[
                         system_prompt, temperature, max_tokens, top_p,
@@ -603,7 +475,6 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
         timer.tick(active_model_info, outputs=active_model_box)
-        timer.tick(lambda: manager.logs(), outputs=console)
     return demo
 
 
@@ -611,7 +482,7 @@ def _restore_in_background() -> None:
     try:
         manager.restore()
     except Exception as exc:
-        manager._append_log(f"Automatic restore failed: {exc}")
+        manager.append_log(f"Automatic restore failed: {exc}")
 
 
 def find_free_port(host: str, start_port: int) -> int:

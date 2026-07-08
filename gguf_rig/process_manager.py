@@ -148,6 +148,10 @@ class VllmServerManager:
     def _append_log(self, message: str) -> None:
         self._log_lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message.rstrip()}")
 
+    def append_log(self, message: str) -> None:
+        """Public interface for appending a log message."""
+        self._append_log(message)
+
     def logs(self, limit: int = 300) -> str:
         with self._lock:
             return "\n".join(list(self._log_lines)[-max(1, int(limit)):])
