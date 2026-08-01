@@ -38,6 +38,7 @@ class RigConfig:
     auto_restart: bool = False
     auto_restart_max_retries: int = 3
     max_log_bytes: int = 50 * 1024 * 1024  # 50 MB
+    panel_find_free_port: bool = False
 
     @classmethod
     def from_env(cls) -> "RigConfig":
@@ -64,6 +65,7 @@ class RigConfig:
             auto_restart=_env_bool("SAFETENSORS_AUTO_RESTART"),
             auto_restart_max_retries=int(os.environ.get("SAFETENSORS_AUTO_RESTART_MAX_RETRIES", "3")),
             max_log_bytes=int(os.environ.get("SAFETENSORS_MAX_LOG_BYTES", str(50 * 1024 * 1024))),
+            panel_find_free_port=_env_bool("SAFETENSORS_PANEL_FIND_FREE_PORT"),
         )
 
     @property
@@ -77,6 +79,10 @@ class RigConfig:
     @property
     def server_log_file(self) -> Path:
         return self.log_dir / "vllm.log"
+
+    @property
+    def event_log_file(self) -> Path:
+        return self.log_dir / "events.jsonl"
 
     @property
     def local_api_url(self) -> str:

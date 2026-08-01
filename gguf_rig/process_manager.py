@@ -12,12 +12,13 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .config import RigConfig
 from .library import ModelLibrary, normalize_dtype
+from .system import gpu_stats
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class ActiveModel:
     chat_template: str = ""
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
+    auto_adjust_context: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActiveModel":
@@ -46,6 +48,7 @@ class ActiveModel:
             chat_template=str(data.get("chat_template", "")),
             enforce_eager=bool(data.get("enforce_eager", False)),
             enable_chunked_prefill=bool(data.get("enable_chunked_prefill", False)),
+            auto_adjust_context=bool(data.get("auto_adjust_context", True)),
         )
 
     def validate(self) -> None:
@@ -66,27 +69,27 @@ class ActiveModel:
 # Prometheus metrics parser (minimal, for vLLM /metrics endpoint)
 # ---------------------------------------------------------------------------
 
-_PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([\d.eE+-]+)$")
+_PROM_LINE_RE = re.compile(
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([\d.eE+-]+)(?:\s+\d+)?$"
+)
 
 
 def _parse_prometheus_simple(text: str) -> dict[str, float]:
     """Parse a Prometheus exposition text into a flat {metric_name: value} dict.
 
-    Only lines without labels are captured; labeled lines are skipped for
-    simplicity.  This is sufficient for the vLLM scalar gauges we care about.
+    Labeled series with the same metric name are summed. This makes the parser
+    work with both single-model and per-model/per-engine vLLM metrics.
     """
     result: dict[str, float] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Skip lines with labels (contain '{').
-        if "{" in line:
-            continue
         match = _PROM_LINE_RE.match(line)
         if match:
             try:
-                result[match.group(1)] = float(match.group(2))
+                name = match.group(1)
+                result[name] = result.get(name, 0.0) + float(match.group(2))
             except ValueError:
                 pass
     return result
@@ -104,7 +107,8 @@ class VllmServerManager:
         self._active: ActiveModel | None = None
         self._started_at: float | None = None
         self._log_lines: deque[str] = deque(maxlen=2_000)
-        self._log_handle = None
+        self._log_handle: Any = None
+        self._event_lock = threading.Lock()
         self._intentional_stop = False
         # Auto-restart state.
         self._restart_count = 0
@@ -146,7 +150,45 @@ class VllmServerManager:
     # -- Logging --------------------------------------------------------
 
     def _append_log(self, message: str) -> None:
-        self._log_lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message.rstrip()}")
+        clean = message.rstrip()
+        self._log_lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {clean}")
+        self._write_event("log", message=clean)
+
+    def _write_event(self, event: str, **fields: Any) -> None:
+        payload = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": event,
+            **fields,
+        }
+        try:
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self._event_lock:
+                if (
+                    self.config.event_log_file.exists()
+                    and self.config.event_log_file.stat().st_size > self.config.max_log_bytes
+                ):
+                    rotated = self.config.event_log_file.with_suffix(".jsonl.1")
+                    rotated.unlink(missing_ok=True)
+                    self.config.event_log_file.replace(rotated)
+                with self.config.event_log_file.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+        except OSError:
+            pass
+
+    def recent_events(self, limit: int = 100, *, include_logs: bool = False) -> list[dict[str, Any]]:
+        rows: deque[dict[str, Any]] = deque(maxlen=max(1, int(limit)))
+        try:
+            with self.config.event_log_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        payload = json.loads(line)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    if include_logs or payload.get("event") != "log":
+                        rows.append(payload)
+        except OSError:
+            pass
+        return list(rows)
 
     def logs(self, limit: int = 300) -> str:
         with self._lock:
@@ -234,6 +276,46 @@ class VllmServerManager:
             command.append("--enable-chunked-prefill")
         return command
 
+    def preflight(self, active: ActiveModel) -> dict[str, Any]:
+        """Validate GPU topology and estimate weight-memory headroom."""
+        active.validate()
+        model = self.library.get(active.model_id)
+        devices = gpu_stats()
+        if not devices:
+            raise RuntimeError("No NVIDIA GPUs detected by nvidia-smi")
+        if active.tensor_parallel_size > len(devices):
+            raise ValueError(
+                f"Tensor parallel size {active.tensor_parallel_size} exceeds "
+                f"the {len(devices)} visible GPU(s)"
+            )
+
+        selected = devices[:active.tensor_parallel_size]
+        min_available_gib = min(
+            device["memory_total_mib"] * active.gpu_memory_utilization / 1024
+            for device in selected
+        )
+        # Safetensors size approximates weight memory. Add 15% for runtime
+        # tensors; KV cache and CUDA graphs consume the remaining headroom.
+        target_bits = {"bfloat16": 16, "float16": 16, "float32": 32}[normalize_dtype(active.dtype)]
+        source_bits = {"bf16": 16, "fp16": 16, "fp32": 32}
+        known_source = [source_bits[dtype] for dtype in model.dtypes if dtype in source_bits]
+        dtype_scale = target_bits / min(known_source) if known_source else 1.0
+        estimated_per_gpu_gib = (
+            model.size_gib * dtype_scale * 1.15 / active.tensor_parallel_size
+        )
+        if estimated_per_gpu_gib > min_available_gib:
+            raise RuntimeError(
+                f"Estimated weights require {estimated_per_gpu_gib:.1f} GiB/GPU, "
+                f"but only {min_available_gib:.1f} GiB/GPU is allowed by "
+                "gpu_memory_utilization"
+            )
+        return {
+            "gpu_count": len(devices),
+            "tensor_parallel_size": active.tensor_parallel_size,
+            "estimated_weight_gib_per_gpu": round(estimated_per_gpu_gib, 2),
+            "available_gib_per_gpu": round(min_available_gib, 2),
+        }
+
     def _health(self, timeout: float = 1.5) -> tuple[bool, str]:
         request = urllib.request.Request(f"{self.config.local_api_url}/health")
         if self.config.api_key:
@@ -287,11 +369,18 @@ class VllmServerManager:
             self._append_log(f"Ignoring invalid saved state: {exc}")
             return None
 
-    def _launch(self, active: ActiveModel, persist: bool) -> None:
+    def _launch_once(self, active: ActiveModel, persist: bool) -> None:
         if not self.config.python_executable.is_file():
             raise FileNotFoundError(f"Python executable not found at {self.config.python_executable}")
         self._rotate_log_if_needed()
         command = self.build_command(active)
+        self._write_event(
+            "launch_started",
+            model=active.model_id,
+            dtype=normalize_dtype(active.dtype),
+            max_model_len=active.max_model_len,
+            tensor_parallel_size=active.tensor_parallel_size,
+        )
         safe_command = ["***" if index and command[index - 1] == "--api-key" else part for index, part in enumerate(command)]
         self._append_log("Starting: " + " ".join(safe_command))
         self._log_handle = self.config.server_log_file.open("a", encoding="utf-8", buffering=1)
@@ -307,9 +396,60 @@ class VllmServerManager:
             self._stop_locked()
             raise
         self._append_log(f"Ready on {self.config.local_api_url}")
+        self._write_event(
+            "launch_ready",
+            model=active.model_id,
+            dtype=normalize_dtype(active.dtype),
+            max_model_len=active.max_model_len,
+        )
         self._restart_count = 0  # Reset restart counter on success.
         if persist:
             self._write_state(active)
+
+    @staticmethod
+    def _is_context_memory_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(fragment in text for fragment in (
+            "out of memory",
+            "cuda oom",
+            "kv cache",
+            "maximum model length",
+            "max_model_len",
+            "no available memory",
+        ))
+
+    def _launch(self, active: ActiveModel, persist: bool) -> None:
+        preflight = self.preflight(active)
+        self._append_log(
+            "Preflight: "
+            f"TP={preflight['tensor_parallel_size']}, "
+            f"weights≈{preflight['estimated_weight_gib_per_gpu']} GiB/GPU, "
+            f"allowed={preflight['available_gib_per_gpu']} GiB/GPU"
+        )
+        candidate = active
+        while True:
+            try:
+                self._intentional_stop = False
+                self._launch_once(candidate, persist)
+                if candidate.max_model_len != active.max_model_len:
+                    self._append_log(
+                        f"Context auto-adjusted from {active.max_model_len} "
+                        f"to {candidate.max_model_len}"
+                    )
+                return
+            except Exception as exc:
+                next_context = max(512, candidate.max_model_len // 2)
+                if (
+                    not active.auto_adjust_context
+                    or next_context >= candidate.max_model_len
+                    or not self._is_context_memory_error(exc)
+                ):
+                    raise
+                self._append_log(
+                    f"Startup failed because of memory/context limits; retrying "
+                    f"with max_model_len={next_context}"
+                )
+                candidate = replace(candidate, max_model_len=next_context)
 
     def _capture_output(self, process: subprocess.Popen[str]) -> None:
         if process.stdout is None:
@@ -371,7 +511,7 @@ class VllmServerManager:
                 self._append_log(f"Auto-restart: failed — {exc}")
 
     def start(self, active: ActiveModel, *, persist: bool = True) -> None:
-        with self._lock:
+        with self.library.operation_lock, self._lock:
             if self._process and self._process.poll() is None:
                 raise RuntimeError("vLLM is already running; use switch() or restart()")
             self._intentional_stop = False
@@ -379,10 +519,11 @@ class VllmServerManager:
             self._launch(active, persist)
 
     def switch(self, active: ActiveModel) -> str:
-        with self._lock:
+        with self.library.operation_lock, self._lock:
             previous = self._active if self._process and self._process.poll() is None else None
             if previous == active:
                 return "The selected model and dtype are already active."
+            self.preflight(active)
             self._stop_locked()
             try:
                 self._intentional_stop = False
@@ -390,6 +531,11 @@ class VllmServerManager:
                 self._launch(active, persist=True)
                 return f"Activated {active.model_id} as {normalize_dtype(active.dtype)}"
             except Exception as new_error:
+                self._write_event(
+                    "activation_failed",
+                    model=active.model_id,
+                    error=str(new_error),
+                )
                 self._append_log(f"Activation failed: {new_error}")
                 if previous:
                     try:
@@ -434,10 +580,11 @@ class VllmServerManager:
                 self._process = None
                 return "vLLM is already stopped."
             self._stop_locked()
+            self._write_event("server_stopped", model=self._active.model_id if self._active else None)
             return "vLLM stopped."
 
     def restart(self) -> str:
-        with self._lock:
+        with self.library.operation_lock, self._lock:
             active = self._active or self.load_saved()
             if not active:
                 raise RuntimeError("No active or saved model to restart")
@@ -489,6 +636,16 @@ class VllmServerManager:
             self._status_cache = result
             self._status_cache_time = time.monotonic()
             return result
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return promptly for external health probes, even during long startup."""
+        if not self._lock.acquire(blocking=False):
+            return {"state": "busy", "model": self._active.model_id if self._active else None}
+        try:
+            status = self.status()
+            return {"state": status["state"], "model": status["model"]}
+        finally:
+            self._lock.release()
 
     # -- vLLM Prometheus metrics ----------------------------------------
 

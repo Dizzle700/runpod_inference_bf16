@@ -29,7 +29,35 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 : "${SAFETENSORS_PANEL_USER:?Set SAFETENSORS_PANEL_USER as a RunPod secret}"
 : "${SAFETENSORS_PANEL_PASSWORD:?Set SAFETENSORS_PANEL_PASSWORD as a RunPod secret}"
 
-if [[ "${SAFETENSORS_SKIP_INSTALL:-0}" != "1" || ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_DIR/.safetensors-rig-installed" ]]; then
+VLLM_CONSTRAINTS="${SAFETENSORS_VLLM_CONSTRAINTS:-$SCRIPT_DIR/constraints-vllm-torch280.txt}"
+INSTALL_FINGERPRINT_FILE="$VENV_DIR/.safetensors-rig-requirements.sha256"
+CURRENT_FINGERPRINT="$(
+    {
+        sha256sum "$SCRIPT_DIR/requirements.txt" "$SCRIPT_DIR/requirements-vllm.txt"
+        if [[ -f "$VLLM_CONSTRAINTS" ]]; then
+            sha256sum "$VLLM_CONSTRAINTS"
+        fi
+        printf '%s\n' \
+            "system_site_packages=${SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES:-1}" \
+            "install_vllm=${SAFETENSORS_INSTALL_VLLM:-auto}" \
+            "expected_vllm=${SAFETENSORS_EXPECTED_VLLM_VERSION:-0.11.0}"
+    } | sha256sum | cut -d' ' -f1
+)"
+INSTALLED_FINGERPRINT=""
+if [[ -f "$INSTALL_FINGERPRINT_FILE" ]]; then
+    INSTALLED_FINGERPRINT="$(<"$INSTALL_FINGERPRINT_FILE")"
+fi
+
+NEEDS_INSTALL=0
+if [[ ! -x "$VENV_DIR/bin/python" || ! -f "$VENV_DIR/.safetensors-rig-installed" || "$CURRENT_FINGERPRINT" != "$INSTALLED_FINGERPRINT" ]]; then
+    NEEDS_INSTALL=1
+fi
+
+if [[ "$NEEDS_INSTALL" == "1" && "${SAFETENSORS_SKIP_INSTALL:-0}" == "1" ]]; then
+    echo "Installation is stale or missing, but SAFETENSORS_SKIP_INSTALL=1." >&2
+    exit 1
+fi
+if [[ "$NEEDS_INSTALL" == "1" ]]; then
     bash "$SCRIPT_DIR/install_runpod.sh"
 fi
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -8,6 +12,7 @@ import pytest
 from gguf_rig.config import RigConfig
 from gguf_rig.library import ModelLibrary, normalize_dtype
 from gguf_rig.process_manager import ActiveModel, VllmServerManager
+from gguf_rig.streaming import iter_sse_data
 
 
 def make_config(tmp_path: Path, **overrides) -> RigConfig:
@@ -77,6 +82,50 @@ def test_library_requires_config_and_safetensors(tmp_path: Path):
         ModelLibrary(config).get("org/incomplete")
 
 
+def test_library_rejects_incomplete_indexed_snapshot(tmp_path: Path):
+    config = make_config(tmp_path)
+    repo = config.models_dir / "org" / "incomplete"
+    repo.mkdir(parents=True)
+    (repo / "config.json").write_text("{}")
+    write_safetensors(repo / "model-00001-of-00002.safetensors")
+    (repo / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            "layer.0": "model-00001-of-00002.safetensors",
+            "layer.1": "model-00002-of-00002.safetensors",
+        }
+    }))
+
+    library = ModelLibrary(config)
+    assert library.scan() == []
+    with pytest.raises(FileNotFoundError, match="missing weight file"):
+        library.get("org/incomplete")
+
+
+def test_failed_download_preserves_previous_model(tmp_path: Path, monkeypatch):
+    config = make_config(tmp_path)
+    previous = make_model(config)
+    previous_config = (previous / "config.json").read_text()
+
+    def incomplete_download(*, local_dir, **kwargs):
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text('{"new": true}')
+        write_safetensors(local_dir / "model-00001-of-00002.safetensors")
+        raise RuntimeError("network interrupted")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=incomplete_download),
+    )
+
+    with pytest.raises(RuntimeError, match="network interrupted"):
+        ModelLibrary(config).download_snapshot("org/repo")
+
+    assert (previous / "config.json").read_text() == previous_config
+    assert not list((config.models_dir / ".staging").glob("*/org/repo"))
+
+
 def test_library_rejects_path_escape(tmp_path: Path):
     library = ModelLibrary(make_config(tmp_path))
     with pytest.raises(ValueError, match="escapes"):
@@ -106,6 +155,25 @@ def test_library_delete_nonexistent(tmp_path: Path):
     library = ModelLibrary(make_config(tmp_path))
     with pytest.raises(FileNotFoundError):
         library.delete("org/nonexistent")
+
+
+def test_model_operation_lock_serializes_delete(tmp_path: Path):
+    config = make_config(tmp_path)
+    make_model(config)
+    library = ModelLibrary(config)
+    completed = threading.Event()
+
+    def delete():
+        library.delete("org/repo")
+        completed.set()
+
+    with library.operation_lock:
+        worker = threading.Thread(target=delete)
+        worker.start()
+        time.sleep(0.05)
+        assert not completed.is_set()
+    worker.join(timeout=1)
+    assert completed.is_set()
 
 
 def test_remote_repo_validation():
@@ -146,6 +214,41 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     assert "--enable-chunked-prefill" in command
 
 
+def test_preflight_rejects_tensor_parallel_larger_than_visible_gpus(tmp_path: Path, monkeypatch):
+    config = make_config(tmp_path)
+    make_model(config)
+    manager = VllmServerManager(config, ModelLibrary(config))
+    monkeypatch.setattr(
+        "gguf_rig.process_manager.gpu_stats",
+        lambda: [{"memory_total_mib": 24_576}],
+    )
+
+    with pytest.raises(ValueError, match="exceeds"):
+        manager.preflight(ActiveModel(model_id="org/repo", tensor_parallel_size=2))
+
+
+def test_context_fallback_halves_context_after_oom(tmp_path: Path, monkeypatch):
+    config = make_config(tmp_path)
+    make_model(config)
+    manager = VllmServerManager(config, ModelLibrary(config))
+    attempted = []
+    monkeypatch.setattr(manager, "preflight", lambda active: {
+        "tensor_parallel_size": 1,
+        "estimated_weight_gib_per_gpu": 1.0,
+        "available_gib_per_gpu": 20.0,
+    })
+
+    def launch_once(active, persist):
+        attempted.append(active.max_model_len)
+        if len(attempted) == 1:
+            raise RuntimeError("CUDA out of memory while allocating KV cache")
+
+    monkeypatch.setattr(manager, "_launch_once", launch_once)
+    manager._launch(ActiveModel(model_id="org/repo", max_model_len=8192), persist=False)
+
+    assert attempted == [8192, 4096]
+
+
 def test_saved_state_round_trip(tmp_path: Path):
     config = make_config(tmp_path)
     make_model(config)
@@ -174,6 +277,7 @@ def test_config_new_fields_defaults(tmp_path: Path):
     assert config.auto_restart is False
     assert config.auto_restart_max_retries == 3
     assert config.max_log_bytes == 50 * 1024 * 1024
+    assert config.panel_find_free_port is False
 
 
 def test_config_new_fields_custom(tmp_path: Path):
@@ -232,11 +336,11 @@ def test_prometheus_parser():
     text = """
 # HELP vllm_num_requests_running Number of running requests
 # TYPE vllm_num_requests_running gauge
-vllm_num_requests_running 3
-vllm_num_requests_waiting 1
+vllm_num_requests_running{model_name="current",engine="0"} 2
+vllm_num_requests_running{model_name="current",engine="1"} 1
+vllm_num_requests_waiting{model_name="current"} 1
 vllm_gpu_cache_usage_perc 0.45
 vllm_avg_generation_throughput_toks_per_s 120.5
-# Some labeled metric we skip
 vllm_request_duration{method="POST"} 0.123
 """
     result = _parse_prometheus_simple(text)
@@ -244,4 +348,28 @@ vllm_request_duration{method="POST"} 0.123
     assert result["vllm_num_requests_waiting"] == 1.0
     assert result["vllm_gpu_cache_usage_perc"] == 0.45
     assert result["vllm_avg_generation_throughput_toks_per_s"] == 120.5
-    assert "vllm_request_duration" not in result  # Labeled lines are skipped.
+    assert result["vllm_request_duration"] == 0.123
+
+
+def test_sse_parser_stops_at_done_without_consuming_more_data():
+    def lines():
+        yield b': keep-alive\n'
+        yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n'
+        yield b'\n'
+        yield b'data: {"choices":[],"usage":{"completion_tokens":1}}\n'
+        yield b'\n'
+        yield b'data: [DONE]\n'
+        yield b'\n'
+        raise AssertionError("SSE parser consumed data after [DONE]")
+
+    assert list(iter_sse_data(lines())) == [
+        '{"choices":[{"delta":{"content":"hello"}}]}',
+        '{"choices":[],"usage":{"completion_tokens":1}}',
+    ]
+
+
+def test_sse_parser_accepts_multiline_data_and_eof_without_blank_line():
+    assert list(iter_sse_data([
+        b"data: first\n",
+        b"data:second\n",
+    ])) == ["first\nsecond"]

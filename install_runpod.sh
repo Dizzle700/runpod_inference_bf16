@@ -11,6 +11,7 @@ INSTALL_VLLM="${SAFETENSORS_INSTALL_VLLM:-auto}"
 EXPECTED_VLLM_VERSION="${SAFETENSORS_EXPECTED_VLLM_VERSION:-0.11.0}"
 VLLM_CONSTRAINTS="${SAFETENSORS_VLLM_CONSTRAINTS:-$SCRIPT_DIR/constraints-vllm-torch280.txt}"
 UPGRADE_PIP="${SAFETENSORS_UPGRADE_PIP:-0}"
+INSTALL_FINGERPRINT_FILE="$VENV_DIR/.safetensors-rig-requirements.sha256"
 
 info() { printf '\033[0;34m%s\033[0m\n' "$*"; }
 success() { printf '\033[0;32m%s\033[0m\n' "$*"; }
@@ -22,6 +23,19 @@ enabled() {
         1|true|yes|on) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+requirements_fingerprint() {
+    {
+        sha256sum "$SCRIPT_DIR/requirements.txt" "$SCRIPT_DIR/requirements-vllm.txt"
+        if [[ -f "$VLLM_CONSTRAINTS" ]]; then
+            sha256sum "$VLLM_CONSTRAINTS"
+        fi
+        printf '%s\n' \
+            "system_site_packages=$VENV_SYSTEM_SITE_PACKAGES" \
+            "install_vllm=$INSTALL_VLLM" \
+            "expected_vllm=$EXPECTED_VLLM_VERSION"
+    } | sha256sum | cut -d' ' -f1
 }
 
 package_available() {
@@ -84,7 +98,11 @@ if enabled "$UPGRADE_PIP"; then
 fi
 
 info "Installing control-panel dependencies..."
-"$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+control_pip_args=(-r "$SCRIPT_DIR/requirements.txt")
+if [[ -f "$VLLM_CONSTRAINTS" ]]; then
+    control_pip_args=(-c "$VLLM_CONSTRAINTS" "${control_pip_args[@]}")
+fi
+"$VENV_DIR/bin/python" -m pip install "${control_pip_args[@]}"
 
 case "${INSTALL_VLLM,,}" in
     auto|"")
@@ -119,5 +137,6 @@ mkdir -p \
     "$VOLUME_ROOT/logs/safetensors-rig" \
     "$VOLUME_ROOT/.hf/hub"
 touch "$VENV_DIR/.safetensors-rig-installed"
+requirements_fingerprint > "$INSTALL_FINGERPRINT_FILE"
 
 success "Safetensors Rig is installed in $VENV_DIR"

@@ -30,7 +30,8 @@ os.environ.setdefault("HF_HUB_CACHE", str(DEFAULT_VOLUME / ".hf" / "hub"))
 
 import gradio as gr  # noqa: E402
 
-from gguf_rig import ActiveModel, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
+from gguf_rig import ActiveModel, DownloadCancelled, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
+from gguf_rig.streaming import iter_sse_data  # noqa: E402
 from gguf_rig.system import disk_stats, gpu_stats  # noqa: E402
 
 
@@ -52,6 +53,7 @@ config = RigConfig.from_env()
 config.ensure_directories()
 library = ModelLibrary(config)
 manager = VllmServerManager(config, library)
+download_cancel_event = threading.Event()
 
 
 def _format_uptime(seconds: int) -> str:
@@ -143,7 +145,8 @@ def _model_choices() -> list[tuple[str, str]]:
     return [
         (
             f"{record.id} · {record.dtype_label} · "
-            f"{record.shard_count} shard(s) · {record.size_gib:.2f} GiB",
+            f"{record.shard_count} shard(s) · {record.size_gib:.2f} GiB · "
+            f"{record.revision or 'local'}@{record.commit_sha[:8] or 'unknown'}",
             record.id,
         )
         for record in library.scan()
@@ -157,21 +160,55 @@ def refresh_library(selected: str | None = None):
     return gr.update(choices=choices, value=value), dashboard_markdown()
 
 
-def inspect_remote(repo_id: str):
+def library_status_markdown() -> str:
+    statuses = library.statuses()
+    if not statuses:
+        return "_No local or in-progress models._"
+    lines = ["| Model | Revision | Commit | Status |", "| --- | --- | --- | --- |"]
+    icons = {"ready": "✅", "downloading": "⬇️", "incomplete": "⚠️", "broken": "❌"}
+    for item in statuses:
+        lines.append(
+            f"| `{item['model']}` | `{item['revision']}` | `{item['commit']}` | "
+            f"{icons.get(item['status'], '⚠️')} {item['status']} |"
+        )
+    return "\n".join(lines)
+
+
+def event_history_markdown() -> str:
+    events = manager.recent_events(50)
+    if not events:
+        return "_No lifecycle events recorded yet._"
+    lines = ["| Time (UTC) | Event | Model | Detail |", "| --- | --- | --- | --- |"]
+    for event in reversed(events):
+        detail = event.get("error") or (
+            f"ctx={event['max_model_len']}" if event.get("max_model_len") else ""
+        )
+        lines.append(
+            f"| `{event.get('timestamp', '')}` | `{event.get('event', '')}` | "
+            f"`{event.get('model') or '—'}` | {html.escape(str(detail))} |"
+        )
+    return "\n".join(lines)
+
+
+def inspect_remote(repo_id: str, revision: str):
     try:
-        remote = library.inspect_remote(repo_id, token=config.hf_token or None)
+        remote = library.inspect_remote(repo_id, token=config.hf_token or None, revision=revision)
         return (
             f"✅ **{remote.repo_id}** · {remote.shard_count} Safetensors file(s) · "
             f"{remote.size_label} · metadata dtype: `{remote.config_dtype}` · "
+            f"revision: `{remote.revision}` · commit: `{remote.commit_sha}` · "
             f"HF token: **{'configured' if config.hf_token else 'not configured'}**"
         )
     except Exception as exc:
         return f"❌ {html.escape(str(exc))}"
 
 
-def download_remote(repo_id: str, progress=gr.Progress()):
+def download_remote(repo_id: str, revision: str, progress=gr.Progress()):
+    download_cancel_event.clear()
     try:
-        remote = library.inspect_remote(repo_id, token=config.hf_token or None)
+        remote = library.inspect_remote(
+            repo_id, token=config.hf_token or None, revision=revision
+        )
 
         def report(value: float, description: str) -> None:
             progress(value, desc=description)
@@ -179,14 +216,24 @@ def download_remote(repo_id: str, progress=gr.Progress()):
         path = library.download_snapshot(
             remote.repo_id,
             token=config.hf_token or None,
+            revision=remote.revision,
+            commit_sha=remote.commit_sha,
             expected_size=remote.size_bytes,
             progress=report,
+            cancelled=download_cancel_event.is_set,
         )
         choices = _model_choices()
         model_id = path.relative_to(config.models_dir.resolve()).as_posix()
         return f"✅ Downloaded complete model snapshot to `{path}`", gr.update(choices=choices, value=model_id)
+    except DownloadCancelled as exc:
+        return f"⚠️ {html.escape(str(exc))}", gr.update()
     except Exception as exc:
         return f"❌ {html.escape(str(exc))}", gr.update()
+
+
+def cancel_download():
+    download_cancel_event.set()
+    return "⚠️ Cancellation requested; the current file transfer will stop at its next progress update."
 
 
 def delete_model(model_id: str | None, confirm_delete: bool):
@@ -218,6 +265,7 @@ def activate_model(
     chat_template: str,
     enforce_eager: bool,
     enable_chunked_prefill: bool,
+    auto_adjust_context: bool,
     confirm_switch: bool,
 ):
     if not model_id:
@@ -236,6 +284,7 @@ def activate_model(
         chat_template=(chat_template or "").strip(),
         enforce_eager=bool(enforce_eager),
         enable_chunked_prefill=bool(enable_chunked_prefill),
+        auto_adjust_context=bool(auto_adjust_context),
     )
     try:
         return f"✅ {manager.switch(active)}", dashboard_markdown()
@@ -298,6 +347,7 @@ def chat_stream(
         "model": model_name,
         "messages": messages,
         "stream": True,
+        "stream_options": {"include_usage": True},
         "temperature": temperature,
         "max_tokens": int(max_tokens),
         "top_p": top_p,
@@ -323,9 +373,11 @@ def chat_stream(
     t0 = time.monotonic()
     latency = 0.0
     accumulated = ""
-    total_tokens = 0
+    streamed_chunks = 0
+    completion_tokens: int | None = None
     error_occurred = False
     finish_reason = None
+    conn: http.client.HTTPConnection | None = None
 
     try:
         conn = http.client.HTTPConnection(host, port, timeout=120)
@@ -338,46 +390,44 @@ def chat_stream(
             yield f"❌ HTTP {response.status}: {error_msg[:500]}"
             return
 
-        buffer = ""
-        while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8", errors="replace")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
+        for data_str in iter_sse_data(response):
+            try:
+                event = json.loads(data_str)
+                usage = event.get("usage")
+                if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                    completion_tokens = int(usage["completion_tokens"])
+
+                choices = event.get("choices") or []
+                if not choices:
                     continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(data_str)
-                        choice = event.get("choices", [{}])[0]
-                        delta = choice.get("delta", {})
-                        content = delta.get("content", "")
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
-                        if content:
-                            accumulated += content
-                            total_tokens += 1  # Approximate token count.
-                            yield accumulated
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
-        conn.close()
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                content = delta.get("content", "")
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                if content:
+                    accumulated += content
+                    streamed_chunks += 1
+                    yield accumulated
+            except (TypeError, ValueError, json.JSONDecodeError, IndexError, KeyError):
+                pass
     except Exception as e:
         error_occurred = True
         yield f"❌ Error: {e}"
         return
     finally:
         latency = time.monotonic() - t0
-        manager.record_api_call(tokens=total_tokens, latency=latency, error=error_occurred)
+        if conn is not None:
+            conn.close()
+        manager.record_api_call(tokens=completion_tokens or 0, latency=latency, error=error_occurred)
 
-    if not error_occurred and total_tokens > 0:
-        speed = total_tokens / latency if latency > 0 else 0.0
-        stats = f"\n\n⚡ *{speed:.1f} tok/s | {total_tokens} tokens | {latency:.2f}s*"
+    if not error_occurred and completion_tokens is not None:
+        speed = completion_tokens / latency if latency > 0 else 0.0
+        stats = f"\n\n⚡ *{speed:.1f} tok/s | {completion_tokens} tokens | {latency:.2f}s*"
+        accumulated += stats
+    elif not error_occurred and streamed_chunks > 0:
+        speed = streamed_chunks / latency if latency > 0 else 0.0
+        stats = f"\n\n⚡ *{speed:.1f} chunks/s | {streamed_chunks} chunks | {latency:.2f}s*"
         accumulated += stats
 
     # Warn if response was truncated.
@@ -458,6 +508,10 @@ def build_app() -> gr.Blocks:
                         enable_chunked_prefill = gr.Checkbox(
                             label="Enable chunked prefill (helps prevent OOM on long contexts)"
                         )
+                        auto_adjust_context = gr.Checkbox(
+                            label="Auto-reduce context after KV-cache/OOM startup failure",
+                            value=True,
+                        )
                     chat_template = gr.Textbox(label="Chat-template override (normally empty)", lines=3)
                 confirm_switch = gr.Checkbox(label="I understand that switching can interrupt in-flight requests")
                 activate_button = gr.Button("Activate model", variant="primary")
@@ -475,11 +529,19 @@ def build_app() -> gr.Blocks:
                     label="Repository",
                     placeholder="organization/repository or https://huggingface.co/organization/repository",
                 )
+                revision = gr.Textbox(
+                    label="Revision",
+                    value="main",
+                    placeholder="branch, tag, or commit SHA",
+                )
                 with gr.Row():
                     inspect_button = gr.Button("Inspect repository")
                     download_button = gr.Button("Download snapshot", variant="primary")
+                    cancel_download_button = gr.Button("Cancel download", variant="stop")
                 remote_summary = gr.Markdown()
                 download_result = gr.Markdown()
+                gr.Markdown("### Model status")
+                library_status = gr.Markdown(library_status_markdown())
 
                 gr.Markdown("---")
 
@@ -549,6 +611,8 @@ def build_app() -> gr.Blocks:
             with gr.Tab("Console"):
                 console = gr.Textbox(label="vLLM output", value=manager.logs(), lines=28, interactive=False)
                 console_refresh = gr.Button("Refresh log")
+                gr.Markdown("### Launch/error history")
+                event_history = gr.Markdown(event_history_markdown())
 
             with gr.Tab("Settings"):
                 gr.Markdown(f"""
@@ -558,6 +622,7 @@ def build_app() -> gr.Blocks:
 - State: `{config.state_dir}`
 - vLLM Python: `{config.python_executable}`
 - API listener: `{config.api_host}:{config.api_port}`
+- Panel port fallback: **{"enabled (local development)" if config.panel_find_free_port else "disabled (strict bind)"}**
 - API key: **{"configured" if config.api_key else "missing"}**
 - Panel authentication: **{"configured" if config.panel_user and config.panel_password else "missing"}**
 - Hugging Face token: **{"configured" if config.hf_token else "not configured"}**
@@ -576,34 +641,58 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         # -- Event wiring --------------------------------------------------
 
         refresh_dashboard.click(dashboard_markdown, outputs=dashboard)
-        restart_button.click(restart_server, outputs=[dashboard_message, dashboard])
-        stop_button.click(stop_server, outputs=[dashboard_message, dashboard])
+        restart_button.click(
+            restart_server,
+            outputs=[dashboard_message, dashboard],
+            concurrency_limit=1,
+            concurrency_id="model_operations",
+        )
+        stop_button.click(
+            stop_server,
+            outputs=[dashboard_message, dashboard],
+            concurrency_limit=1,
+            concurrency_id="model_operations",
+        )
         refresh_models.click(refresh_library, inputs=model_select, outputs=[model_select, dashboard])
         activate_button.click(
             activate_model,
             inputs=[
                 model_select, dtype, max_model_len, max_num_seqs,
                 tensor_parallel_size, gpu_memory_utilization, trust_remote_code,
-                chat_template, enforce_eager, enable_chunked_prefill, confirm_switch,
+                chat_template, enforce_eager, enable_chunked_prefill,
+                auto_adjust_context, confirm_switch,
             ],
             outputs=[activation_result, dashboard],
             concurrency_limit=1,
+            concurrency_id="model_operations",
         )
-        inspect_button.click(inspect_remote, inputs=repo_id, outputs=remote_summary)
+        inspect_button.click(inspect_remote, inputs=[repo_id, revision], outputs=remote_summary)
         download_button.click(
-            download_remote, inputs=repo_id, outputs=[download_result, model_select], concurrency_limit=1
+            download_remote,
+            inputs=[repo_id, revision],
+            outputs=[download_result, model_select],
+            concurrency_limit=1,
+            concurrency_id="model_operations",
+        )
+        cancel_download_button.click(
+            cancel_download,
+            outputs=download_result,
+            queue=False,
         )
         delete_button.click(
             delete_model,
             inputs=[model_select, confirm_delete],
             outputs=[delete_result, model_select, dashboard],
             concurrency_limit=1,
+            concurrency_id="model_operations",
         )
         console_refresh.click(lambda: manager.logs(), outputs=console)
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
         timer.tick(active_model_info, outputs=active_model_box)
         timer.tick(lambda: manager.logs(), outputs=console)
+        timer.tick(library_status_markdown, outputs=library_status)
+        timer.tick(event_history_markdown, outputs=event_history)
     return demo
 
 
@@ -628,27 +717,45 @@ def find_free_port(host: str, start_port: int) -> int:
 
 
 def main() -> None:
+    from fastapi import FastAPI
+    import uvicorn
+
     config.validate_security()
     demo = build_app()
     threading.Thread(target=_restore_in_background, daemon=True).start()
     auth = (config.panel_user, config.panel_password) if config.panel_user and config.panel_password else None
 
-    # Retry port binding up to 3 times to reduce TOCTOU race window.
-    last_error = None
-    for attempt in range(3):
-        port = find_free_port(config.panel_host, config.panel_port)
-        if port != config.panel_port:
-            print(f"⚠️ Port {config.panel_port} was busy. Switched to {port}.")
-        try:
-            demo.queue(default_concurrency_limit=4).launch(
-                server_name=config.panel_host, server_port=port, auth=auth, show_error=True
-            )
-            return
-        except OSError as exc:
-            last_error = exc
-            print(f"⚠️ Port {port} became unavailable (attempt {attempt + 1}/3), retrying...")
-            time.sleep(0.5)
-    raise RuntimeError(f"Failed to bind to any port after 3 attempts: {last_error}")
+    port = find_free_port(config.panel_host, config.panel_port)
+    if port != config.panel_port and not config.panel_find_free_port:
+        raise OSError(
+            f"Configured panel port {config.panel_port} is already in use; "
+            "strict binding is enabled"
+        )
+    if port != config.panel_port:
+        print(f"⚠️ Port {config.panel_port} was busy. Switched to {port}.")
+
+    web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @web_app.get("/healthz")
+    def healthz():
+        status = manager.health_snapshot()
+        return {
+            "status": "ok",
+            "panel": "ready",
+            "vllm": status["state"],
+            "model": status["model"],
+        }
+
+    demo.queue(default_concurrency_limit=4)
+    web_app = gr.mount_gradio_app(
+        web_app,
+        demo,
+        path="/",
+        auth=auth,
+        server_name=config.panel_host,
+        server_port=port,
+    )
+    uvicorn.run(web_app, host=config.panel_host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

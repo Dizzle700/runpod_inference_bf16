@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -17,6 +20,13 @@ IGNORED_WEIGHT_PATTERNS = ["*.bin", "*.pt", "*.pth", "*.ckpt", "*.h5", "*.msgpac
 
 # Safetensors header limit: 10 MB is generous; legitimate headers are typically < 2 MB.
 _MAX_HEADER_BYTES = 10 * 1024 * 1024
+_SHARD_RE = re.compile(r"^(?P<prefix>.+)-(?P<number>\d{5})-of-(?P<total>\d{5})\.safetensors$")
+_METADATA_FILE = ".rig-metadata.json"
+_COMPLETE_FILE = ".download-complete"
+
+
+class DownloadCancelled(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -26,6 +36,9 @@ class ModelRecord:
     size_bytes: int
     dtypes: tuple[str, ...]
     shard_count: int
+    revision: str = ""
+    commit_sha: str = ""
+    status: str = "ready"
 
     @property
     def size_gib(self) -> float:
@@ -42,6 +55,8 @@ class RemoteModel:
     size_bytes: int | None
     shard_count: int
     config_dtype: str
+    revision: str
+    commit_sha: str
 
     @property
     def size_label(self) -> str:
@@ -68,6 +83,57 @@ def _read_safetensors_dtypes(path: Path) -> set[str]:
         return set()
 
 
+def _validate_model_snapshot(model_dir: Path) -> list[Path]:
+    """Return verified root weight files, rejecting incomplete snapshots."""
+    if not (model_dir / "config.json").is_file():
+        raise FileNotFoundError(f"Missing config.json in: {model_dir}")
+
+    shards = sorted(model_dir.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No Safetensors weights found in: {model_dir}")
+
+    indexes = sorted(model_dir.glob("*.safetensors.index.json"))
+    for index_path in indexes:
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map = payload["weight_map"]
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("weight_map is empty")
+            expected_names = {str(name) for name in weight_map.values()}
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Safetensors index {index_path.name}: {exc}") from exc
+
+        for name in expected_names:
+            expected = (model_dir / name).resolve()
+            if model_dir.resolve() not in expected.parents or not expected.is_file():
+                raise FileNotFoundError(f"Incomplete snapshot: missing weight file {name}")
+
+    # Some repositories omit the index despite using conventional numbered shards.
+    groups: dict[tuple[str, int], set[int]] = {}
+    for shard in shards:
+        match = _SHARD_RE.match(shard.name)
+        if match:
+            key = (match.group("prefix"), int(match.group("total")))
+            groups.setdefault(key, set()).add(int(match.group("number")))
+    for (prefix, total), present in groups.items():
+        expected_numbers = set(range(1, total + 1))
+        if present != expected_numbers:
+            missing = sorted(expected_numbers - present)
+            raise FileNotFoundError(
+                f"Incomplete snapshot: {prefix} is missing shard(s) "
+                + ", ".join(f"{number:05d}-of-{total:05d}" for number in missing[:10])
+            )
+    return shards
+
+
+def _read_metadata(model_dir: Path) -> dict[str, str]:
+    try:
+        payload = json.loads((model_dir / _METADATA_FILE).read_text(encoding="utf-8"))
+        return {str(key): str(value) for key, value in payload.items()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
 def normalize_dtype(value: str) -> str:
     aliases = {
         "bf16": "bfloat16",
@@ -90,6 +156,7 @@ def normalize_dtype(value: str) -> str:
 class ModelLibrary:
     def __init__(self, config: RigConfig):
         self.config = config
+        self.operation_lock = threading.RLock()
         self.config.ensure_directories()
 
     def _safe_local_path(self, path: Path | str) -> Path:
@@ -126,10 +193,11 @@ class ModelLibrary:
         records: list[ModelRecord] = []
         for config_path in root.rglob("config.json"):
             model_dir = config_path.parent
-            if ".cache" in model_dir.parts:
+            if ".cache" in model_dir.parts or ".staging" in model_dir.parts:
                 continue
-            shards = sorted(model_dir.glob("*.safetensors"))
-            if not shards:
+            try:
+                shards = _validate_model_snapshot(model_dir)
+            except (FileNotFoundError, ValueError):
                 continue
             dtypes: set[str] = set()
             for shard in shards:
@@ -140,29 +208,36 @@ class ModelLibrary:
                 size_bytes=sum(shard.stat().st_size for shard in shards),
                 dtypes=tuple(sorted(dtypes)),
                 shard_count=len(shards),
+                revision=_read_metadata(model_dir).get("revision", ""),
+                commit_sha=_read_metadata(model_dir).get("commit_sha", ""),
             ))
         return sorted(records, key=lambda item: item.id.lower())
 
     def get(self, model_id: str) -> ModelRecord:
         model_dir = self._safe_local_path(self.config.models_dir / model_id)
-        if not model_dir.is_dir() or not (model_dir / "config.json").is_file():
+        if not model_dir.is_dir():
             raise FileNotFoundError(f"Model not found: {model_id}")
-        shards = sorted(model_dir.glob("*.safetensors"))
-        if not shards:
-            raise FileNotFoundError(f"No Safetensors weights found in: {model_id}")
+        shards = _validate_model_snapshot(model_dir)
         dtypes: set[str] = set()
         for shard in shards:
             dtypes.update(_read_safetensors_dtypes(shard))
+        metadata = _read_metadata(model_dir)
         return ModelRecord(
             model_dir.relative_to(self.config.models_dir.resolve()).as_posix(),
             model_dir,
             sum(p.stat().st_size for p in shards),
             tuple(sorted(dtypes)),
             len(shards),
+            metadata.get("revision", ""),
+            metadata.get("commit_sha", ""),
         )
 
     def delete(self, model_id: str) -> str:
         """Delete a downloaded model from the persistent volume."""
+        with self.operation_lock:
+            return self._delete_unlocked(model_id)
+
+    def _delete_unlocked(self, model_id: str) -> str:
         model_dir = self._safe_local_path(self.config.models_dir / model_id)
         if not model_dir.is_dir():
             raise FileNotFoundError(f"Model not found: {model_id}")
@@ -179,29 +254,68 @@ class ModelLibrary:
                 break
         return f"Deleted {model_id} ({size_gib:.2f} GiB freed)"
 
-    def inspect_remote(self, repo_id: str, token: str | None = None) -> RemoteModel:
+    def inspect_remote(self, repo_id: str, token: str | None = None, revision: str = "") -> RemoteModel:
         repo_id = self.validate_repo_id(repo_id)
+        revision = revision.strip() or "main"
         try:
             from huggingface_hub import HfApi
         except ImportError as exc:
             raise RuntimeError("huggingface-hub is not installed") from exc
-        info = HfApi(token=token or None).model_info(repo_id=repo_id, files_metadata=True)
+        info = HfApi(token=token or None).model_info(
+            repo_id=repo_id, revision=revision, files_metadata=True
+        )
         tensors = [item for item in info.siblings or [] if getattr(item, "rfilename", "").lower().endswith(".safetensors")]
         if not tensors:
             raise ValueError("This repository has no .safetensors weights")
         sizes = [getattr(item, "size", None) for item in tensors]
-        total = sum(sizes) if all(size is not None for size in sizes) else None
+        total = sum(int(size) for size in sizes if size is not None) if all(
+            size is not None for size in sizes
+        ) else None
         config_dtype = "unknown"
         safetensors_meta = getattr(info, "safetensors", None)
         parameters = getattr(safetensors_meta, "parameters", None)
         if isinstance(parameters, dict) and parameters:
             config_dtype = "/".join(sorted(str(key).lower() for key in parameters))
-        return RemoteModel(repo_id, total, len(tensors), config_dtype)
+        return RemoteModel(
+            repo_id, total, len(tensors), config_dtype, revision, str(getattr(info, "sha", "") or "")
+        )
 
     def free_bytes(self) -> int:
         return shutil.disk_usage(self.config.models_dir).free
 
-    def download_snapshot(self, repo_id: str, *, token: str | None = None, expected_size: int | None = None, progress: Callable[[float, str], None] | None = None) -> Path:
+    def download_snapshot(
+        self,
+        repo_id: str,
+        *,
+        token: str | None = None,
+        revision: str = "main",
+        commit_sha: str = "",
+        expected_size: int | None = None,
+        progress: Callable[[float, str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Path:
+        with self.operation_lock:
+            return self._download_snapshot_unlocked(
+                repo_id,
+                token=token,
+                revision=revision,
+                commit_sha=commit_sha,
+                expected_size=expected_size,
+                progress=progress,
+                cancelled=cancelled,
+            )
+
+    def _download_snapshot_unlocked(
+        self,
+        repo_id: str,
+        *,
+        token: str | None,
+        revision: str,
+        commit_sha: str,
+        expected_size: int | None,
+        progress: Callable[[float, str], None] | None,
+        cancelled: Callable[[], bool] | None,
+    ) -> Path:
         repo_id = self.validate_repo_id(repo_id)
         if expected_size is not None and self.free_bytes() < expected_size + 1024**3:
             raise OSError("Not enough free volume space (a 1 GiB safety margin is required)")
@@ -210,88 +324,129 @@ class ModelLibrary:
         except ImportError as exc:
             raise RuntimeError("huggingface-hub is not installed") from exc
         destination = self.config.models_dir.joinpath(*repo_id.split("/"))
-        destination.mkdir(parents=True, exist_ok=True)
+        staging_root = self.config.models_dir / ".staging" / uuid.uuid4().hex
+        staging = staging_root.joinpath(*repo_id.split("/"))
+        backup = staging_root / ".previous"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        (staging_root / "status.json").write_text(
+            json.dumps({"repo_id": repo_id, "revision": revision, "status": "downloading"}),
+            encoding="utf-8",
+        )
 
-        class TqdmProgressWrapper:
+        from tqdm.auto import tqdm
+
+        progress_lock = threading.Lock()
+
+        class ProgressTqdm(tqdm):
+            """Per-download progress adapter; avoids process-global monkey-patching."""
+
             def __init__(self, *args, **kwargs):
-                self._total = kwargs.get("total") or 100
-                self._n = 0
-                self._desc = kwargs.get("desc") or "Downloading"
-                self._unit = kwargs.get("unit") or "B"
-                if progress:
-                    progress(0.0, self._desc)
+                kwargs.setdefault("disable", True)
+                super().__init__(*args, **kwargs)
+                self._report()
 
             def update(self, n=1):
-                self._n += n
-                ratio = min(1.0, max(0.0, self._n / self._total))
-                if progress:
-                    if self._unit.lower() in ("b", "byte", "bytes"):
-                        desc = f"{self._desc} ({self._n / 1024**2:.1f}MB / {self._total / 1024**2:.1f}MB)"
-                    else:
-                        desc = f"{self._desc} ({self._n} / {self._total})"
-                    progress(ratio, desc)
+                updated = super().update(n)
+                self._report()
+                return updated
 
-            def close(self):
-                if progress:
-                    progress(1.0, self._desc)
-
-            def set_description(self, desc, refresh=True):
-                self._desc = desc
-
-            def set_postfix(self, *args, **kwargs):
-                pass
-
-            def refresh(self):
-                pass
-
-            def reset(self, total=None):
-                if total is not None:
-                    self._total = total
-                self._n = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                self.close()
-
-        class PatchTqdm:
-            def __init__(self, wrapper):
-                self.wrapper = wrapper
-                self.originals = {}
-
-            def __enter__(self):
-                import sys
-                import tqdm
-                import tqdm.auto
-                for mod in (tqdm, tqdm.auto):
-                    if hasattr(mod, "tqdm"):
-                        self.originals[(mod, "tqdm")] = getattr(mod, "tqdm")
-                        setattr(mod, "tqdm", self.wrapper)
-                for name, module in list(sys.modules.items()):
-                    if name.startswith("huggingface_hub") and module:
-                        for attr in ("tqdm", "tqdm_auto"):
-                            if hasattr(module, attr):
-                                self.originals[(module, attr)] = getattr(module, attr)
-                                try:
-                                    setattr(module, attr, self.wrapper)
-                                except Exception:
-                                    pass
-
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                for (target, attr), original in self.originals.items():
-                    try:
-                        setattr(target, attr, original)
-                    except Exception:
-                        pass
+            def _report(self):
+                if cancelled and cancelled():
+                    raise DownloadCancelled(f"Download cancelled: {repo_id}@{revision}")
+                if not progress:
+                    return
+                total = float(self.total or 0)
+                ratio = min(0.95, max(0.05, float(self.n) / total)) if total else 0.05
+                description = str(self.desc or "Downloading")
+                with progress_lock:
+                    progress(ratio, description)
 
         if progress:
             progress(0.05, f"Downloading {repo_id}")
 
-        with PatchTqdm(TqdmProgressWrapper):
-            snapshot_download(repo_id=repo_id, local_dir=destination, token=token or None, ignore_patterns=IGNORED_WEIGHT_PATTERNS)
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=staging,
+                revision=commit_sha or revision,
+                token=token or None,
+                ignore_patterns=IGNORED_WEIGHT_PATTERNS,
+                tqdm_class=ProgressTqdm,
+            )
+            if cancelled and cancelled():
+                raise DownloadCancelled(f"Download cancelled: {repo_id}@{revision}")
+            verified_shards = _validate_model_snapshot(staging)
+            (staging / _METADATA_FILE).write_text(
+                json.dumps(
+                    {
+                        "repo_id": repo_id,
+                        "revision": revision,
+                        "commit_sha": commit_sha,
+                        "downloaded_at": int(time.time()),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (staging / _COMPLETE_FILE).write_text("ok\n", encoding="utf-8")
 
-        model = self.get(destination.relative_to(self.config.models_dir).as_posix())
-        if progress:
-            progress(1.0, f"Saved {model.shard_count} Safetensors file(s)")
-        return destination
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                destination.rename(backup)
+            try:
+                staging.rename(destination)
+            except Exception:
+                if backup.exists() and not destination.exists():
+                    backup.rename(destination)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+            if progress:
+                progress(1.0, f"Saved {len(verified_shards)} Safetensors file(s)")
+            return destination
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    def statuses(self) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        records = self.scan()
+        ready_ids = {record.id for record in records}
+        for record in records:
+            result.append({
+                "model": record.id,
+                "revision": record.revision or "unknown",
+                "commit": record.commit_sha[:12] or "unknown",
+                "status": "ready",
+            })
+        root = self.config.models_dir.resolve()
+        for config_path in root.rglob("config.json"):
+            if ".cache" in config_path.parts or ".staging" in config_path.parts:
+                continue
+            model_id = config_path.parent.relative_to(root).as_posix()
+            if model_id not in ready_ids:
+                try:
+                    _validate_model_snapshot(config_path.parent)
+                    status = "ready"
+                except FileNotFoundError:
+                    status = "incomplete"
+                except ValueError:
+                    status = "broken"
+                result.append({
+                    "model": model_id,
+                    "revision": "unknown",
+                    "commit": "unknown",
+                    "status": status,
+                })
+        for status_path in (root / ".staging").glob("*/status.json"):
+            try:
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                result.append({
+                    "model": str(payload.get("repo_id", "unknown")),
+                    "revision": str(payload.get("revision", "unknown")),
+                    "commit": "pending",
+                    "status": "downloading",
+                })
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        return result
