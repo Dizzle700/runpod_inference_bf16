@@ -17,11 +17,8 @@ _GPU_CACHE_TTL: float = 3.0
 def gpu_stats() -> list[dict[str, Any]]:
     """Return GPU info from nvidia-smi, cached for up to 3 seconds."""
     global _gpu_cache, _gpu_cache_time
-    now = time.monotonic()
-    if now - _gpu_cache_time < _GPU_CACHE_TTL:
-        return _gpu_cache
     with _gpu_cache_lock:
-        # Double-check after acquiring the lock.
+        now = time.monotonic()
         if now - _gpu_cache_time < _GPU_CACHE_TTL:
             return _gpu_cache
         _gpu_cache = _gpu_stats_uncached()

@@ -190,6 +190,10 @@ class VllmServerManager:
             pass
         return list(rows)
 
+    def append_log(self, message: str) -> None:
+        """Public interface for appending a log message."""
+        self._append_log(message)
+
     def logs(self, limit: int = 300) -> str:
         with self._lock:
             return "\n".join(list(self._log_lines)[-max(1, int(limit)):])

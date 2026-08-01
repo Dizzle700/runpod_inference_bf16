@@ -75,9 +75,13 @@ if [[ ! -d "$VOLUME_ROOT" ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-info "Installing Python/runtime prerequisites..."
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates git python3-venv
+if [ "$(id -u)" -eq 0 ]; then
+    info "Installing Python/runtime prerequisites..."
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates git python3-venv
+else
+    info "Not running as root; skipping apt-get. Ensure ca-certificates, git, and python3-venv are installed."
+fi
 
 venv_args=("$PYTHON_EXE" -m venv)
 if enabled "$VENV_SYSTEM_SITE_PACKAGES"; then

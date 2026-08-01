@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import html
-import http.client
 import json
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -30,8 +28,13 @@ os.environ.setdefault("HF_HUB_CACHE", str(DEFAULT_VOLUME / ".hf" / "hub"))
 
 import gradio as gr  # noqa: E402
 
+<<<<<<< HEAD
 from gguf_rig import ActiveModel, DownloadCancelled, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
 from gguf_rig.streaming import iter_sse_data  # noqa: E402
+=======
+from gguf_rig import ActiveModel, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
+from gguf_rig.chat_client import ChatClient  # noqa: E402
+>>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
 from gguf_rig.system import disk_stats, gpu_stats  # noqa: E402
 
 
@@ -53,7 +56,11 @@ config = RigConfig.from_env()
 config.ensure_directories()
 library = ModelLibrary(config)
 manager = VllmServerManager(config, library)
+<<<<<<< HEAD
 download_cancel_event = threading.Event()
+=======
+chat_client = ChatClient(config, manager)
+>>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
 
 
 def _format_uptime(seconds: int) -> str:
@@ -306,6 +313,7 @@ def stop_server():
         return f"❌ {html.escape(str(exc))}", dashboard_markdown()
 
 
+<<<<<<< HEAD
 def chat_stream(
     message: str,
     history: list[dict[str, Any]],
@@ -435,6 +443,8 @@ def chat_stream(
         accumulated += "\n\n⚠️ *Response truncated (max_tokens reached)*"
     
     yield accumulated
+=======
+>>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
 
 
 def active_model_info() -> str:
@@ -594,7 +604,7 @@ def build_app() -> gr.Blocks:
                             label="Frequency penalty", value=0.0, minimum=-2.0, maximum=2.0, step=0.05
                         )
                 gr.ChatInterface(
-                    fn=chat_stream,
+                    fn=chat_client.stream,
                     type="messages",
                     additional_inputs=[
                         system_prompt, temperature, max_tokens, top_p,
@@ -690,9 +700,12 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
         timer.tick(active_model_info, outputs=active_model_box)
+<<<<<<< HEAD
         timer.tick(lambda: manager.logs(), outputs=console)
         timer.tick(library_status_markdown, outputs=library_status)
         timer.tick(event_history_markdown, outputs=event_history)
+=======
+>>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
     return demo
 
 
@@ -700,7 +713,7 @@ def _restore_in_background() -> None:
     try:
         manager.restore()
     except Exception as exc:
-        manager._append_log(f"Automatic restore failed: {exc}")
+        manager.append_log(f"Automatic restore failed: {exc}")
 
 
 def find_free_port(host: str, start_port: int) -> int:
