@@ -7,7 +7,6 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -28,13 +27,7 @@ os.environ.setdefault("HF_HUB_CACHE", str(DEFAULT_VOLUME / ".hf" / "hub"))
 
 import gradio as gr  # noqa: E402
 
-<<<<<<< HEAD
-from gguf_rig import ActiveModel, DownloadCancelled, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
-from gguf_rig.streaming import iter_sse_data  # noqa: E402
-=======
-from gguf_rig import ActiveModel, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
-from gguf_rig.chat_client import ChatClient  # noqa: E402
->>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
+from gguf_rig import ActiveModel, ChatClient, DownloadCancelled, ModelLibrary, RigConfig, VllmServerManager  # noqa: E402
 from gguf_rig.system import disk_stats, gpu_stats  # noqa: E402
 
 
@@ -56,11 +49,8 @@ config = RigConfig.from_env()
 config.ensure_directories()
 library = ModelLibrary(config)
 manager = VllmServerManager(config, library)
-<<<<<<< HEAD
 download_cancel_event = threading.Event()
-=======
 chat_client = ChatClient(config, manager)
->>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
 
 
 def _format_uptime(seconds: int) -> str:
@@ -98,6 +88,8 @@ def dashboard_markdown() -> str:
             params.append("eager")
         if status.get("enable_chunked_prefill"):
             params.append("chunked-prefill")
+        if status.get("max_audio_per_prompt"):
+            params.append(f"audio ≤{status['max_audio_per_prompt']}/request")
         if params:
             lines.append(f"- **Params:** {' · '.join(params)}")
 
@@ -273,6 +265,7 @@ def activate_model(
     enforce_eager: bool,
     enable_chunked_prefill: bool,
     auto_adjust_context: bool,
+    max_audio_per_prompt: float,
     confirm_switch: bool,
 ):
     if not model_id:
@@ -292,6 +285,7 @@ def activate_model(
         enforce_eager=bool(enforce_eager),
         enable_chunked_prefill=bool(enable_chunked_prefill),
         auto_adjust_context=bool(auto_adjust_context),
+        max_audio_per_prompt=int(max_audio_per_prompt),
     )
     try:
         return f"✅ {manager.switch(active)}", dashboard_markdown()
@@ -311,140 +305,6 @@ def stop_server():
         return f"✅ {manager.stop()}", dashboard_markdown()
     except Exception as exc:
         return f"❌ {html.escape(str(exc))}", dashboard_markdown()
-
-
-<<<<<<< HEAD
-def chat_stream(
-    message: str,
-    history: list[dict[str, Any]],
-    system_prompt: str,
-    temperature: float,
-    max_tokens: int,
-    top_p: float,
-    repetition_penalty: float,
-    top_k: int,
-    presence_penalty: float,
-    frequency_penalty: float,
-    min_p: float,
-):
-    status = manager.status()
-    if not status["healthy"]:
-        yield "❌ Server is not ready or stopped. Please activate a model first."
-        return
-
-    messages: list[dict[str, str]] = []
-
-    # Add system prompt if provided.
-    system_prompt = (system_prompt or "").strip()
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
-    for h in history:
-        if isinstance(h, dict):
-            messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
-        else:
-            messages.append({"role": getattr(h, "role", "user"), "content": getattr(h, "content", "")})
-    messages.append({"role": "user", "content": message})
-
-    model_name = manager.served_model_name()
-    parsed_url = urlparse(config.local_api_url)
-    host = parsed_url.hostname or "127.0.0.1"
-    port = parsed_url.port or config.api_port
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "temperature": temperature,
-        "max_tokens": int(max_tokens),
-        "top_p": top_p,
-    }
-    if repetition_penalty != 1.0:
-        payload["repetition_penalty"] = repetition_penalty
-    if presence_penalty != 0.0:
-        payload["presence_penalty"] = presence_penalty
-    if frequency_penalty != 0.0:
-        payload["frequency_penalty"] = frequency_penalty
-    if top_k != -1:
-        payload["top_k"] = int(top_k)
-    if min_p != 0.0:
-        payload["min_p"] = min_p
-
-    headers = {"Content-Type": "application/json"}
-    if config.api_key:
-        headers["Authorization"] = f"Bearer {config.api_key}"
-
-    body = json.dumps(payload).encode("utf-8")
-    headers["Content-Length"] = str(len(body))
-
-    t0 = time.monotonic()
-    latency = 0.0
-    accumulated = ""
-    streamed_chunks = 0
-    completion_tokens: int | None = None
-    error_occurred = False
-    finish_reason = None
-    conn: http.client.HTTPConnection | None = None
-
-    try:
-        conn = http.client.HTTPConnection(host, port, timeout=120)
-        conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
-        response = conn.getresponse()
-
-        if response.status != 200:
-            error_msg = response.read().decode(errors="replace")
-            error_occurred = True
-            yield f"❌ HTTP {response.status}: {error_msg[:500]}"
-            return
-
-        for data_str in iter_sse_data(response):
-            try:
-                event = json.loads(data_str)
-                usage = event.get("usage")
-                if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
-                    completion_tokens = int(usage["completion_tokens"])
-
-                choices = event.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get("delta", {})
-                content = delta.get("content", "")
-                if choice.get("finish_reason"):
-                    finish_reason = choice["finish_reason"]
-                if content:
-                    accumulated += content
-                    streamed_chunks += 1
-                    yield accumulated
-            except (TypeError, ValueError, json.JSONDecodeError, IndexError, KeyError):
-                pass
-    except Exception as e:
-        error_occurred = True
-        yield f"❌ Error: {e}"
-        return
-    finally:
-        latency = time.monotonic() - t0
-        if conn is not None:
-            conn.close()
-        manager.record_api_call(tokens=completion_tokens or 0, latency=latency, error=error_occurred)
-
-    if not error_occurred and completion_tokens is not None:
-        speed = completion_tokens / latency if latency > 0 else 0.0
-        stats = f"\n\n⚡ *{speed:.1f} tok/s | {completion_tokens} tokens | {latency:.2f}s*"
-        accumulated += stats
-    elif not error_occurred and streamed_chunks > 0:
-        speed = streamed_chunks / latency if latency > 0 else 0.0
-        stats = f"\n\n⚡ *{speed:.1f} chunks/s | {streamed_chunks} chunks | {latency:.2f}s*"
-        accumulated += stats
-
-    # Warn if response was truncated.
-    if finish_reason == "length":
-        accumulated += "\n\n⚠️ *Response truncated (max_tokens reached)*"
-    
-    yield accumulated
-=======
->>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
 
 
 def active_model_info() -> str:
@@ -505,6 +365,9 @@ def build_app() -> gr.Blocks:
                         max_model_len = gr.Number(label="Max model length", value=8192, precision=0, minimum=512)
                         max_num_seqs = gr.Number(label="Max concurrent sequences", value=64, precision=0, minimum=1)
                         tensor_parallel_size = gr.Number(label="Tensor parallel GPUs", value=1, precision=0, minimum=1)
+                        max_audio_per_prompt = gr.Number(
+                            label="Max audio clips per request", value=1, precision=0, minimum=1, maximum=8
+                        )
                         gpu_memory_utilization = gr.Slider(
                             label="GPU memory utilization", value=0.90, minimum=0.05, maximum=1.0, step=0.01
                         )
@@ -569,6 +432,17 @@ def build_app() -> gr.Blocks:
             with gr.Tab("Playground"):
                 active_model_box = gr.Markdown(active_model_info(), elem_classes="active-model-box")
                 gr.Markdown("### Chat Playground")
+                audio_file = gr.Audio(
+                    label="Audio input (optional)",
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                )
+                gr.Markdown(
+                    "For Audio Flamingo Next, upload one mono 16 kHz clip and ask a direct "
+                    "question (ASR, captioning, translation, timestamps, etc.). "
+                    f"Uploads are limited to {config.max_audio_upload_bytes / 1024**2:.0f} MiB.",
+                    elem_classes="rig-note",
+                )
                 with gr.Accordion("Generation settings", open=False):
                     system_prompt = gr.Textbox(
                         label="System prompt",
@@ -608,7 +482,8 @@ def build_app() -> gr.Blocks:
                     type="messages",
                     additional_inputs=[
                         system_prompt, temperature, max_tokens, top_p,
-                        repetition_penalty, top_k, presence_penalty, frequency_penalty, min_p
+                        repetition_penalty, top_k, presence_penalty, frequency_penalty, min_p,
+                        audio_file,
                     ],
                     examples=[
                         ["Explain quantum computing in simple terms."],
@@ -670,7 +545,7 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
                 model_select, dtype, max_model_len, max_num_seqs,
                 tensor_parallel_size, gpu_memory_utilization, trust_remote_code,
                 chat_template, enforce_eager, enable_chunked_prefill,
-                auto_adjust_context, confirm_switch,
+                auto_adjust_context, max_audio_per_prompt, confirm_switch,
             ],
             outputs=[activation_result, dashboard],
             concurrency_limit=1,
@@ -700,12 +575,9 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
         timer = gr.Timer(5)
         timer.tick(dashboard_markdown, outputs=dashboard)
         timer.tick(active_model_info, outputs=active_model_box)
-<<<<<<< HEAD
         timer.tick(lambda: manager.logs(), outputs=console)
         timer.tick(library_status_markdown, outputs=library_status)
         timer.tick(event_history_markdown, outputs=event_history)
-=======
->>>>>>> 8acb5c99fc0ec8176f7f50df663fe4cba33be977
     return demo
 
 

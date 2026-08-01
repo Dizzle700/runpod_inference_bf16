@@ -29,7 +29,7 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 : "${SAFETENSORS_PANEL_USER:?Set SAFETENSORS_PANEL_USER as a RunPod secret}"
 : "${SAFETENSORS_PANEL_PASSWORD:?Set SAFETENSORS_PANEL_PASSWORD as a RunPod secret}"
 
-VLLM_CONSTRAINTS="${SAFETENSORS_VLLM_CONSTRAINTS:-$SCRIPT_DIR/constraints-vllm-torch280.txt}"
+VLLM_CONSTRAINTS="${SAFETENSORS_VLLM_CONSTRAINTS:-$SCRIPT_DIR/constraints-vllm-afnext.txt}"
 INSTALL_FINGERPRINT_FILE="$VENV_DIR/.safetensors-rig-requirements.sha256"
 CURRENT_FINGERPRINT="$(
     {
@@ -40,7 +40,7 @@ CURRENT_FINGERPRINT="$(
         printf '%s\n' \
             "system_site_packages=${SAFETENSORS_VENV_SYSTEM_SITE_PACKAGES:-1}" \
             "install_vllm=${SAFETENSORS_INSTALL_VLLM:-auto}" \
-            "expected_vllm=${SAFETENSORS_EXPECTED_VLLM_VERSION:-0.11.0}"
+            "expected_vllm=${SAFETENSORS_EXPECTED_VLLM_VERSION:-0.20.0}"
     } | sha256sum | cut -d' ' -f1
 )"
 INSTALLED_FINGERPRINT=""

@@ -23,12 +23,13 @@ RunPod-панель для запуска Hugging Face моделей в фор�
 - автоматическое уменьшение context length после KV-cache/CUDA OOM;
 - persistent JSONL-журнал и история запусков/ошибок;
 - публичный panel health probe `GET /healthz`.
+- аудио-ввод в Playground и OpenAI-compatible `audio_url` для моделей вроде Audio Flamingo Next.
 
 > Выбор dtype задаёт вычислительный dtype vLLM. Он не переписывает исходные `.safetensors` на диске. FP32 обычно требует примерно вдвое больше памяти весов, чем BF16/FP16. BF16 требует совместимую GPU (обычно NVIDIA Ampere или новее).
 
 ## RunPod
 
-Используйте актуальный CUDA/PyTorch Ubuntu template, network volume с mount path `/workspace` и откройте HTTP-порты `7860,8000`. Проверенный вариант под этот bootstrap: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
+Используйте актуальный CUDA 13 / vLLM template, network volume с mount path `/workspace` и откройте HTTP-порты `7860,8000`. Для Audio Flamingo Next нужен `vllm==0.20.0` и Transformers 5.6+; старый CUDA 12.8 / Torch 2.8 bootstrap для этой модели не подходит. При собственном Docker image ориентируйтесь на `vllm/vllm-openai:v0.20.0` и совместимый NVIDIA driver.
 
 Secrets / Environment Variables:
 
@@ -39,7 +40,7 @@ SAFETENSORS_PANEL_PASSWORD=<сложный пароль>
 HF_TOKEN=<необязательно; нужен для gated/private моделей>
 ```
 
-Команду запуска возьмите из `runpod_command.txt`. Первый запуск создаёт persistent venv. Последующие запуски пропускают установку, пока requirements, constraints и параметры установки не изменились. По умолчанию venv создаётся с `--system-site-packages`, поэтому он видит пакеты из RunPod template. Если vLLM не установлен в template, bootstrap ставит pinned `vllm==0.11.0` через constraints под `torch==2.8.0`, чтобы pip не выбрал новую vLLM и не потянул PyTorch/CUDA/NVIDIA стек другой версии.
+Команду запуска возьмите из `runpod_command.txt`. Первый запуск создаёт persistent venv. Последующие запуски пропускают установку, пока requirements, constraints и параметры установки не изменились. Для Audio Flamingo Next bootstrap устанавливает pinned `vllm==0.20.0` и Transformers 5.6+. Он намеренно не фиксирует Torch: vLLM должен выбрать wheel, соответствующий CUDA/Python в вашем RunPod template.
 
 Если хотите запретить установку vLLM через pip совсем, задайте `SAFETENSORS_INSTALL_VLLM=0`; запуск остановится с ошибкой, если `vllm` не импортируется.
 
@@ -65,6 +66,25 @@ HF_TOKEN=<необязательно; нужен для gated/private модел
 
 Если ответ обрезан по лимиту max_tokens, в конце сообщения появится предупреждение.
 Playground запрашивает usage в streaming-ответе и показывает точные completion tokens/tokens per second. Для старых API без streaming usage явно показывается число chunks, а не приблизительное число токенов.
+
+### Audio Flamingo Next
+
+Загрузите `nvidia/audio-flamingo-next-hf`, выберите BF16 и активируйте его с `Max audio clips per request = 1`. В Playground загрузите WAV/MP3/OGG/FLAC/M4A/WEBM и сформулируйте задачу явно, например: `Transcribe the input speech.` или `Generate a caption for the input audio.` Модель ожидает mono 16 kHz аудио; внутренне она работает 30-секундными окнами и рассчитана на длинные записи.
+
+Playground передаёт файл как `audio_url` data URL в OpenAI-compatible `POST /v1/chat/completions`. Эквивалентный API-запрос:
+
+```json
+{
+  "model": "current",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Transcribe the input speech."},
+      {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,<BASE64_AUDIO>"}}
+    ]
+  }]
+}
+```
 
 ### Дашборд
 
@@ -122,6 +142,7 @@ SAFETENSORS_PANEL_HOST=127.0.0.1 \
 | `SAFETENSORS_AUTO_RESTART` | `0` (выключено) | Автоматический перезапуск vLLM при краше |
 | `SAFETENSORS_AUTO_RESTART_MAX_RETRIES` | `3` | Максимум попыток авто-рестарта |
 | `SAFETENSORS_MAX_LOG_BYTES` | `52428800` (50 MB) | Лимит размера vllm.log перед ротацией |
+| `SAFETENSORS_MAX_AUDIO_UPLOAD_BYTES` | `104857600` (100 MB) | Лимит audio upload в Playground |
 
 Structured lifecycle/runtime events сохраняются в `/workspace/logs/safetensors-rig/events.jsonl`; предыдущая ротация — `events.jsonl.1`. Для RunPod health check используйте `http://<panel>:7860/healthz`.
 

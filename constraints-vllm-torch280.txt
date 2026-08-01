@@ -1,7 +1,6 @@
-torch==2.8.0
-torchaudio==2.8.0
-torchvision==0.23.0
-vllm==0.11.0
-transformers>=4.55.2,<5.0.0
-tokenizers>=0.21.1,<0.23.0
-huggingface-hub>=0.34.0,<1.0.0
+# Audio Flamingo Next requires MusicFlamingo support from vLLM 0.20.0 and
+# Transformers 5.6+. Do not pin Torch: vLLM needs the wheel compatible with
+# the CUDA/Python platform provided by the selected RunPod template.
+vllm==0.20.0
+transformers>=5.6.0,<6.0.0
+huggingface-hub>=0.34.0,<2.0.0

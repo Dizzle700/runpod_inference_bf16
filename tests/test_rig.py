@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from gguf_rig.config import RigConfig
+from gguf_rig.chat_client import ChatClient
 from gguf_rig.library import ModelLibrary, normalize_dtype
 from gguf_rig.process_manager import ActiveModel, VllmServerManager
 from gguf_rig.streaming import iter_sse_data
@@ -209,6 +210,7 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     assert command[command.index("--dtype") + 1] == "float16"
     assert command[command.index("--load-format") + 1] == "safetensors"
     assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    assert json.loads(command[command.index("--limit-mm-per-prompt") + 1]) == {"audio": 1}
     assert command[command.index("--api-key") + 1] == "secret"
     assert "--enforce-eager" in command
     assert "--enable-chunked-prefill" in command
@@ -309,7 +311,29 @@ def test_status_includes_model_params(tmp_path: Path):
     status = manager.status()
     # When no model is active, extended params are None.
     assert status["max_model_len"] is None
+    assert status["max_audio_per_prompt"] is None
     assert status["auto_restart"] is False
+
+
+def test_audio_upload_is_encoded_as_vllm_data_url(tmp_path: Path):
+    config = make_config(tmp_path)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFFtest-audio")
+    client = ChatClient(config, VllmServerManager(config, ModelLibrary(config)))
+
+    data_url = client._audio_data_url(str(audio))
+
+    assert data_url == "data:audio/wav;base64,UklGRnRlc3QtYXVkaW8="
+
+
+def test_audio_upload_respects_size_limit(tmp_path: Path):
+    config = make_config(tmp_path, max_audio_upload_bytes=4)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFFtest")
+    client = ChatClient(config, VllmServerManager(config, ModelLibrary(config)))
+
+    with pytest.raises(ValueError, match="limit"):
+        client._audio_data_url(str(audio))
 
 
 def test_log_rotation(tmp_path: Path):

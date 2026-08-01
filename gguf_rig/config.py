@@ -39,6 +39,7 @@ class RigConfig:
     auto_restart_max_retries: int = 3
     max_log_bytes: int = 50 * 1024 * 1024  # 50 MB
     panel_find_free_port: bool = False
+    max_audio_upload_bytes: int = 100 * 1024 * 1024
 
     @classmethod
     def from_env(cls) -> "RigConfig":
@@ -66,6 +67,9 @@ class RigConfig:
             auto_restart_max_retries=int(os.environ.get("SAFETENSORS_AUTO_RESTART_MAX_RETRIES", "3")),
             max_log_bytes=int(os.environ.get("SAFETENSORS_MAX_LOG_BYTES", str(50 * 1024 * 1024))),
             panel_find_free_port=_env_bool("SAFETENSORS_PANEL_FIND_FREE_PORT"),
+            max_audio_upload_bytes=int(
+                os.environ.get("SAFETENSORS_MAX_AUDIO_UPLOAD_BYTES", str(100 * 1024 * 1024))
+            ),
         )
 
     @property

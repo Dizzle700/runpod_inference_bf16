@@ -34,6 +34,7 @@ class ActiveModel:
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
     auto_adjust_context: bool = True
+    max_audio_per_prompt: int = 1
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActiveModel":
@@ -49,6 +50,7 @@ class ActiveModel:
             enforce_eager=bool(data.get("enforce_eager", False)),
             enable_chunked_prefill=bool(data.get("enable_chunked_prefill", False)),
             auto_adjust_context=bool(data.get("auto_adjust_context", True)),
+            max_audio_per_prompt=int(data.get("max_audio_per_prompt", 1)),
         )
 
     def validate(self) -> None:
@@ -61,6 +63,8 @@ class ActiveModel:
             raise ValueError("Tensor parallel size must be between 1 and 256")
         if not 0.05 <= self.gpu_memory_utilization <= 1.0:
             raise ValueError("GPU memory utilization must be between 0.05 and 1.0")
+        if not 1 <= self.max_audio_per_prompt <= 8:
+            raise ValueError("Audio items per prompt must be between 1 and 8")
         if "\x00" in self.chat_template:
             raise ValueError("Chat template contains an invalid NUL character")
 
@@ -267,6 +271,7 @@ class VllmServerManager:
             "--max-num-seqs", str(active.max_num_seqs),
             "--tensor-parallel-size", str(active.tensor_parallel_size),
             "--gpu-memory-utilization", str(active.gpu_memory_utilization),
+            "--limit-mm-per-prompt", json.dumps({"audio": active.max_audio_per_prompt}),
         ]
         if self.config.api_key:
             command.extend(["--api-key", self.config.api_key])
@@ -635,6 +640,7 @@ class VllmServerManager:
                 "gpu_memory_utilization": self._active.gpu_memory_utilization if self._active else None,
                 "enforce_eager": self._active.enforce_eager if self._active else None,
                 "enable_chunked_prefill": self._active.enable_chunked_prefill if self._active else None,
+                "max_audio_per_prompt": self._active.max_audio_per_prompt if self._active else None,
                 "auto_restart": self.config.auto_restart,
             }
             self._status_cache = result

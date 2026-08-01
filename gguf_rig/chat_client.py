@@ -1,14 +1,17 @@
 """Streaming chat client for vLLM OpenAI-compatible API."""
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .config import RigConfig
 from .process_manager import VllmServerManager
+from .streaming import iter_sse_data
 
 
 class ChatClient:
@@ -17,6 +20,38 @@ class ChatClient:
     def __init__(self, config: RigConfig, manager: VllmServerManager):
         self.config = config
         self.manager = manager
+
+    def _audio_data_url(self, audio_path: str | None) -> str | None:
+        """Convert a Gradio-uploaded audio file to a vLLM-compatible data URL."""
+        if not audio_path:
+            return None
+        path = Path(audio_path)
+        mime_types = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".flac": "audio/flac",
+            ".m4a": "audio/mp4",
+            ".mp4": "audio/mp4",
+            ".webm": "audio/webm",
+        }
+        mime_type = mime_types.get(path.suffix.lower())
+        if mime_type is None:
+            raise ValueError("Upload WAV, MP3, OGG, FLAC, M4A, MP4, or WEBM audio")
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise ValueError("The uploaded audio file is unavailable") from exc
+        if size > self.config.max_audio_upload_bytes:
+            raise ValueError(
+                f"Audio upload is {size / 1024**2:.1f} MiB; the limit is "
+                f"{self.config.max_audio_upload_bytes / 1024**2:.0f} MiB"
+            )
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError as exc:
+            raise ValueError("Could not read the uploaded audio file") from exc
+        return f"data:{mime_type};base64,{encoded}"
 
     def stream(
         self,
@@ -31,6 +66,7 @@ class ChatClient:
         presence_penalty: float,
         frequency_penalty: float,
         min_p: float,
+        audio_file: str | None = None,
     ):
         """Yield incremental text as SSE chunks arrive from vLLM."""
         status = self.manager.status()
@@ -38,7 +74,7 @@ class ChatClient:
             yield "❌ Server is not ready or stopped. Please activate a model first."
             return
 
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
 
         # Add system prompt if provided.
         system_prompt = (system_prompt or "").strip()
@@ -50,7 +86,21 @@ class ChatClient:
                 messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
             else:
                 messages.append({"role": getattr(h, "role", "user"), "content": getattr(h, "content", "")})
-        messages.append({"role": "user", "content": message})
+        try:
+            audio_url = self._audio_data_url(audio_file)
+        except ValueError as exc:
+            yield f"❌ {exc}"
+            return
+        if audio_url:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": message or "Describe this audio."},
+                    {"type": "audio_url", "audio_url": {"url": audio_url}},
+                ],
+            })
+        else:
+            messages.append({"role": "user", "content": message})
 
         model_name = self.manager.served_model_name()
         parsed_url = urlparse(self.config.local_api_url)
@@ -88,8 +138,7 @@ class ChatClient:
         latency = 0.0
         accumulated = ""
         chunk_count = 0
-        usage_tokens = 0
-        total_tokens = 0
+        completion_tokens: int | None = None
         error_occurred = False
         finish_reason = None
         conn = None
@@ -105,42 +154,26 @@ class ChatClient:
                 yield f"❌ HTTP {response.status}: {error_msg[:500]}"
                 return
 
-            buffer = ""
-            done = False
-            while not done:
-                chunk = response.read(4096)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
+            for data_str in iter_sse_data(response):
+                try:
+                    event = json.loads(data_str)
+                    usage = event.get("usage")
+                    if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                        completion_tokens = int(usage["completion_tokens"])
+                    choices = event.get("choices") or []
+                    if not choices:
                         continue
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            done = True
-                            break
-                        try:
-                            event = json.loads(data_str)
-                            choice = event.get("choices", [{}])[0]
-                            delta = choice.get("delta", {})
-                            content = delta.get("content", "")
-                            if choice.get("finish_reason"):
-                                finish_reason = choice["finish_reason"]
-                            # Parse usage from stream (vLLM sends it in the final chunk).
-                            usage = event.get("usage")
-                            if isinstance(usage, dict):
-                                ct = usage.get("completion_tokens")
-                                if ct is not None:
-                                    usage_tokens = int(ct)
-                            if content:
-                                accumulated += content
-                                chunk_count += 1
-                                yield accumulated
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            pass
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    if content:
+                        accumulated += content
+                        chunk_count += 1
+                        yield accumulated
+                except (TypeError, ValueError, json.JSONDecodeError, IndexError, KeyError):
+                    pass
         except Exception as e:
             error_occurred = True
             yield f"❌ Error: {e}"
@@ -149,12 +182,17 @@ class ChatClient:
             if conn:
                 conn.close()
             latency = time.monotonic() - t0
-            total_tokens = usage_tokens or chunk_count
-            self.manager.record_api_call(tokens=total_tokens, latency=latency, error=error_occurred)
+            self.manager.record_api_call(
+                tokens=completion_tokens or 0, latency=latency, error=error_occurred
+            )
 
-        if not error_occurred and total_tokens > 0:
-            speed = total_tokens / latency if latency > 0 else 0.0
-            stats = f"\n\n⚡ *{speed:.1f} tok/s | {total_tokens} tokens | {latency:.2f}s*"
+        if not error_occurred and completion_tokens is not None:
+            speed = completion_tokens / latency if latency > 0 else 0.0
+            stats = f"\n\n⚡ *{speed:.1f} tok/s | {completion_tokens} tokens | {latency:.2f}s*"
+            accumulated += stats
+        elif not error_occurred and chunk_count > 0:
+            speed = chunk_count / latency if latency > 0 else 0.0
+            stats = f"\n\n⚡ *{speed:.1f} chunks/s | {chunk_count} chunks | {latency:.2f}s*"
             accumulated += stats
 
         # Warn if response was truncated.
