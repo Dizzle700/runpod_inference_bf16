@@ -127,6 +127,45 @@ def test_failed_download_preserves_previous_model(tmp_path: Path, monkeypatch):
     assert not list((config.models_dir / ".staging").glob("*/org/repo"))
 
 
+def test_download_progress_tolerates_tqdm_without_description(tmp_path: Path, monkeypatch):
+    """Some tqdm versions report progress before assigning ``desc``."""
+    config = make_config(tmp_path)
+    reported: list[tuple[float, str]] = []
+
+    class FakeTqdm:
+        def __init__(self, *args, **kwargs):
+            self.total = 10
+            self.n = 0
+
+        def update(self, n=1):
+            self.n += n
+            return True
+
+    def snapshot_download(*, local_dir, tqdm_class, **kwargs):
+        progress = tqdm_class(total=10)
+        progress.update(1)
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True)
+        (local_dir / "config.json").write_text("{}")
+        write_safetensors(local_dir / "model.safetensors")
+
+    fake_tqdm = types.ModuleType("tqdm")
+    fake_tqdm.__path__ = []
+    monkeypatch.setitem(sys.modules, "tqdm", fake_tqdm)
+    monkeypatch.setitem(sys.modules, "tqdm.auto", types.SimpleNamespace(tqdm=FakeTqdm))
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=snapshot_download),
+    )
+
+    ModelLibrary(config).download_snapshot(
+        "org/repo", progress=lambda value, description: reported.append((value, description))
+    )
+
+    assert any(description == "Downloading" for _, description in reported)
+
+
 def test_library_rejects_path_escape(tmp_path: Path):
     library = ModelLibrary(make_config(tmp_path))
     with pytest.raises(ValueError, match="escapes"):

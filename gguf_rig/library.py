@@ -357,7 +357,9 @@ class ModelLibrary:
                     return
                 total = float(self.total or 0)
                 ratio = min(0.95, max(0.05, float(self.n) / total)) if total else 0.05
-                description = str(self.desc or "Downloading")
+                # tqdm can call this hook while its own constructor is still
+                # initializing, before ``desc`` has been assigned.
+                description = str(getattr(self, "desc", None) or "Downloading")
                 with progress_lock:
                     progress(ratio, description)
 
