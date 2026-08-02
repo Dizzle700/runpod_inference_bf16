@@ -40,7 +40,15 @@ SAFETENSORS_PANEL_PASSWORD=<сложный пароль>
 HF_TOKEN=<необязательно; нужен для gated/private моделей>
 ```
 
-Команду запуска возьмите из `runpod_command.txt`. Первый запуск создаёт persistent venv. Последующие запуски пропускают установку, пока requirements, constraints и параметры установки не изменились. Для Audio Flamingo Next bootstrap устанавливает pinned `vllm==0.20.0` и Transformers 5.6+. Он намеренно не фиксирует Torch: vLLM должен выбрать wheel, соответствующий CUDA/Python в вашем RunPod template.
+Команду запуска возьмите из `runpod_command.txt`. Она также включает первый bootstrap: скачивает `nvidia/audio-flamingo-next-hf`, запускает его в BF16 и сохраняет конфигурацию на volume. После этого Pod восстанавливает уже скачанную модель, без повторной загрузки. Первый запуск создаёт persistent venv. Последующие запуски пропускают установку, пока requirements, constraints и параметры установки не изменились. Для Audio Flamingo Next bootstrap устанавливает pinned `vllm==0.20.0` и Transformers 5.6+. Он намеренно не фиксирует Torch: vLLM должен выбрать wheel, соответствующий CUDA/Python в вашем RunPod template.
+
+После readiness в логах Pod и на dashboard появится готовый OpenAI-compatible адрес:
+
+```text
+https://<RUNPOD_POD_ID>-8000.proxy.runpod.net/v1
+```
+
+Используйте `SAFETENSORS_API_KEY` как Bearer token. URL строится автоматически из переменной RunPod `RUNPOD_POD_ID`; при custom domain его можно переопределить через `SAFETENSORS_PUBLIC_API_URL`. Панель доступна по `https://<RUNPOD_POD_ID>-7860.proxy.runpod.net`.
 
 Если хотите запретить установку vLLM через pip совсем, задайте `SAFETENSORS_INSTALL_VLLM=0`; запуск остановится с ошибкой, если `vllm` не импортируется.
 
@@ -137,6 +145,16 @@ SAFETENSORS_PANEL_HOST=127.0.0.1 \
 | `SAFETENSORS_API_PORT` | `8000` | Порт OpenAI API |
 | `SAFETENSORS_PANEL_PORT` | `7860` | Порт Gradio панели |
 | `SAFETENSORS_PANEL_FIND_FREE_PORT` | `0` | Искать другой panel port, если заданный занят; включайте только локально |
+| `SAFETENSORS_BOOTSTRAP_MODEL` | пусто | Модель, которую скачать и запустить при первом старте без сохранённой активной модели. `runpod_command.txt` задаёт `nvidia/audio-flamingo-next-hf` |
+| `SAFETENSORS_BOOTSTRAP_REVISION` | `main` | Branch/tag/commit для первичной загрузки |
+| `SAFETENSORS_BOOTSTRAP_DTYPE` | `bfloat16` | dtype первого автоматического запуска |
+| `SAFETENSORS_BOOTSTRAP_MAX_MODEL_LEN` | `8192` | Context length первого запуска |
+| `SAFETENSORS_BOOTSTRAP_MAX_NUM_SEQS` | `64` | Concurrent sequences первого запуска |
+| `SAFETENSORS_BOOTSTRAP_TENSOR_PARALLEL_SIZE` | `1` | Tensor parallel для первого запуска |
+| `SAFETENSORS_BOOTSTRAP_GPU_MEMORY_UTILIZATION` | `0.90` | Доля памяти GPU для первого запуска |
+| `SAFETENSORS_BOOTSTRAP_MAX_AUDIO_PER_PROMPT` | `1` | Максимум audio clips в одном запросе для первого запуска |
+| `SAFETENSORS_PUBLIC_API_URL` | автоматически на RunPod | Явный public API URL для custom domain; иначе `https://<pod>-8000.proxy.runpod.net` |
+| `SAFETENSORS_PUBLIC_PANEL_URL` | автоматически на RunPod | Явный public panel URL для custom domain; иначе `https://<pod>-7860.proxy.runpod.net` |
 | `SAFETENSORS_HEALTH_TIMEOUT` | `600` секунд | Таймаут health check при старте |
 | `SAFETENSORS_STOP_TIMEOUT` | `30` секунд | Таймаут graceful shutdown |
 | `SAFETENSORS_AUTO_RESTART` | `0` (выключено) | Автоматический перезапуск vLLM при краше |

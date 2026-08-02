@@ -40,6 +40,20 @@ class RigConfig:
     max_log_bytes: int = 50 * 1024 * 1024  # 50 MB
     panel_find_free_port: bool = False
     max_audio_upload_bytes: int = 100 * 1024 * 1024
+    bootstrap_model: str = ""
+    bootstrap_revision: str = "main"
+    bootstrap_dtype: str = "bfloat16"
+    bootstrap_max_model_len: int = 8192
+    bootstrap_max_num_seqs: int = 64
+    bootstrap_tensor_parallel_size: int = 1
+    bootstrap_gpu_memory_utilization: float = 0.90
+    bootstrap_trust_remote_code: bool = False
+    bootstrap_enforce_eager: bool = False
+    bootstrap_enable_chunked_prefill: bool = False
+    bootstrap_auto_adjust_context: bool = True
+    bootstrap_max_audio_per_prompt: int = 1
+    public_api_url_override: str = ""
+    public_panel_url_override: str = ""
 
     @classmethod
     def from_env(cls) -> "RigConfig":
@@ -70,6 +84,28 @@ class RigConfig:
             max_audio_upload_bytes=int(
                 os.environ.get("SAFETENSORS_MAX_AUDIO_UPLOAD_BYTES", str(100 * 1024 * 1024))
             ),
+            bootstrap_model=os.environ.get("SAFETENSORS_BOOTSTRAP_MODEL", "").strip(),
+            bootstrap_revision=os.environ.get("SAFETENSORS_BOOTSTRAP_REVISION", "main").strip() or "main",
+            bootstrap_dtype=os.environ.get("SAFETENSORS_BOOTSTRAP_DTYPE", "bfloat16").strip(),
+            bootstrap_max_model_len=int(os.environ.get("SAFETENSORS_BOOTSTRAP_MAX_MODEL_LEN", "8192")),
+            bootstrap_max_num_seqs=int(os.environ.get("SAFETENSORS_BOOTSTRAP_MAX_NUM_SEQS", "64")),
+            bootstrap_tensor_parallel_size=int(
+                os.environ.get("SAFETENSORS_BOOTSTRAP_TENSOR_PARALLEL_SIZE", "1")
+            ),
+            bootstrap_gpu_memory_utilization=float(
+                os.environ.get("SAFETENSORS_BOOTSTRAP_GPU_MEMORY_UTILIZATION", "0.90")
+            ),
+            bootstrap_trust_remote_code=_env_bool("SAFETENSORS_BOOTSTRAP_TRUST_REMOTE_CODE"),
+            bootstrap_enforce_eager=_env_bool("SAFETENSORS_BOOTSTRAP_ENFORCE_EAGER"),
+            bootstrap_enable_chunked_prefill=_env_bool("SAFETENSORS_BOOTSTRAP_ENABLE_CHUNKED_PREFILL"),
+            bootstrap_auto_adjust_context=_env_bool(
+                "SAFETENSORS_BOOTSTRAP_AUTO_ADJUST_CONTEXT", default=True
+            ),
+            bootstrap_max_audio_per_prompt=int(
+                os.environ.get("SAFETENSORS_BOOTSTRAP_MAX_AUDIO_PER_PROMPT", "1")
+            ),
+            public_api_url_override=os.environ.get("SAFETENSORS_PUBLIC_API_URL", "").strip(),
+            public_panel_url_override=os.environ.get("SAFETENSORS_PUBLIC_PANEL_URL", "").strip(),
         )
 
     @property
@@ -91,6 +127,27 @@ class RigConfig:
     @property
     def local_api_url(self) -> str:
         return f"http://127.0.0.1:{self.api_port}"
+
+    def _runpod_proxy_url(self, port: int, override: str) -> str:
+        """Return a public URL when running in a RunPod Pod.
+
+        An explicit override also supports custom domains and other hosting
+        providers. RunPod exposes HTTP ports using this predictable proxy URL.
+        """
+        if override:
+            return override.rstrip("/")
+        pod_id = os.environ.get("RUNPOD_POD_ID", "").strip()
+        if not pod_id:
+            return ""
+        return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+    @property
+    def public_api_url(self) -> str:
+        return self._runpod_proxy_url(self.api_port, self.public_api_url_override)
+
+    @property
+    def public_panel_url(self) -> str:
+        return self._runpod_proxy_url(self.panel_port, self.public_panel_url_override)
 
     def ensure_directories(self) -> None:
         for path in (self.models_dir, self.state_dir, self.log_dir):

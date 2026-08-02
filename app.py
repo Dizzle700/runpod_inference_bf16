@@ -74,6 +74,10 @@ def dashboard_markdown() -> str:
         f"- **Volume:** `{disk['free_gib']:.1f} GiB free` / `{disk['total_gib']:.1f} GiB`",
         f"- **Local API:** `{status['api_url']}`",
     ]
+    if config.public_api_url:
+        lines.append(f"- **OpenAI API base URL:** `{config.public_api_url}/v1`")
+    if config.public_panel_url:
+        lines.append(f"- **Public panel:** `{config.public_panel_url}`")
 
     # Active model parameters.
     if status["model"]:
@@ -581,11 +585,79 @@ Secrets are environment-only. Change them in RunPod Secrets and restart the pod.
     return demo
 
 
-def _restore_in_background() -> None:
+def _bootstrap_active_model() -> ActiveModel:
+    """Build the first-run model settings from explicit environment variables."""
+    return ActiveModel(
+        model_id=library.validate_repo_id(config.bootstrap_model),
+        dtype=config.bootstrap_dtype,
+        max_model_len=config.bootstrap_max_model_len,
+        max_num_seqs=config.bootstrap_max_num_seqs,
+        tensor_parallel_size=config.bootstrap_tensor_parallel_size,
+        gpu_memory_utilization=config.bootstrap_gpu_memory_utilization,
+        trust_remote_code=config.bootstrap_trust_remote_code,
+        enforce_eager=config.bootstrap_enforce_eager,
+        enable_chunked_prefill=config.bootstrap_enable_chunked_prefill,
+        auto_adjust_context=config.bootstrap_auto_adjust_context,
+        max_audio_per_prompt=config.bootstrap_max_audio_per_prompt,
+    )
+
+
+def _log_connection_details() -> None:
+    """Put copyable connection information in the Pod's startup log."""
+    if not config.public_api_url:
+        return
+    lines = [
+        "=== Safetensors Rig connection details ===",
+        f"OpenAI-compatible base URL: {config.public_api_url}/v1",
+        f"Panel URL: {config.public_panel_url or '(not configured)'}",
+        "Authorization: Bearer <SAFETENSORS_API_KEY>",
+    ]
+    for line in lines:
+        print(line, flush=True)
+        manager.append_log(line)
+
+
+def _bootstrap_or_restore_in_background() -> None:
     try:
-        manager.restore()
+        saved = manager.load_saved()
+        if saved:
+            manager.append_log(f"Restoring saved model: {saved.model_id}")
+            manager.restore()
+            _log_connection_details()
+            return
+
+        if not config.bootstrap_model:
+            manager.append_log("No saved model or SAFETENSORS_BOOTSTRAP_MODEL; waiting for manual activation.")
+            _log_connection_details()
+            return
+
+        active = _bootstrap_active_model()
+        try:
+            library.get(active.model_id)
+            manager.append_log(f"Bootstrap model already downloaded: {active.model_id}")
+        except (FileNotFoundError, ValueError):
+            manager.append_log(
+                f"First-run bootstrap: downloading {active.model_id}@{config.bootstrap_revision}"
+            )
+            remote = library.inspect_remote(
+                active.model_id,
+                token=config.hf_token or None,
+                revision=config.bootstrap_revision,
+            )
+            library.download_snapshot(
+                remote.repo_id,
+                token=config.hf_token or None,
+                revision=remote.revision,
+                commit_sha=remote.commit_sha,
+                expected_size=remote.size_bytes,
+            )
+            manager.append_log(f"Bootstrap download complete: {active.model_id}")
+
+        manager.start(active, persist=True)
+        manager.append_log(f"Bootstrap model is ready: {active.model_id}")
+        _log_connection_details()
     except Exception as exc:
-        manager.append_log(f"Automatic restore failed: {exc}")
+        manager.append_log(f"Automatic bootstrap/restore failed: {exc}")
 
 
 def find_free_port(host: str, start_port: int) -> int:
@@ -607,7 +679,7 @@ def main() -> None:
 
     config.validate_security()
     demo = build_app()
-    threading.Thread(target=_restore_in_background, daemon=True).start()
+    threading.Thread(target=_bootstrap_or_restore_in_background, daemon=True).start()
     auth = (config.panel_user, config.panel_password) if config.panel_user and config.panel_password else None
 
     port = find_free_port(config.panel_host, config.panel_port)

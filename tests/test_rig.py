@@ -191,6 +191,26 @@ def test_public_listeners_require_secrets(tmp_path: Path):
         config.validate_security()
 
 
+def test_runpod_proxy_urls_are_built_from_pod_id(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("RUNPOD_POD_ID", "abc123xyz")
+    config = make_config(tmp_path, api_port=8000, panel_port=7860)
+
+    assert config.public_api_url == "https://abc123xyz-8000.proxy.runpod.net"
+    assert config.public_panel_url == "https://abc123xyz-7860.proxy.runpod.net"
+
+
+def test_public_url_overrides_take_priority(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("RUNPOD_POD_ID", "abc123xyz")
+    config = make_config(
+        tmp_path,
+        public_api_url_override="https://api.example.test/",
+        public_panel_url_override="https://panel.example.test/",
+    )
+
+    assert config.public_api_url == "https://api.example.test"
+    assert config.public_panel_url == "https://panel.example.test"
+
+
 def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     config = make_config(tmp_path, api_key="secret")
     config.python_executable.write_bytes(b"python")
