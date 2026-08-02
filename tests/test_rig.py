@@ -264,7 +264,7 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
         enable_chunked_prefill=True
     ))
 
-    assert command[:3] == [str(config.python_executable), "-m", "vllm.entrypoints.openai.api_server"]
+    assert command[:2] == [str(config.python_executable), str(Path(__file__).parents[1] / "vllm_launcher.py")]
     assert command[command.index("--model") + 1] == str(model)
     assert command[command.index("--dtype") + 1] == "float16"
     assert command[command.index("--load-format") + 1] == "safetensors"
@@ -273,6 +273,15 @@ def test_build_command_uses_safetensors_and_selected_dtype(tmp_path: Path):
     assert command[command.index("--api-key") + 1] == "secret"
     assert "--enforce-eager" in command
     assert "--enable-chunked-prefill" in command
+
+
+def test_server_log_redacts_api_keys(tmp_path: Path):
+    config = make_config(tmp_path, api_key="super-secret-token")
+    manager = VllmServerManager(config, ModelLibrary(config))
+
+    line = "non-default args: {'api_key': ['super-secret-token'], 'model': 'local'}"
+
+    assert manager._redact_server_log_line(line) == "non-default args: {'api_key': ['***'], 'model': 'local'}"
 
 
 def test_preflight_rejects_tensor_parallel_larger_than_visible_gpus(tmp_path: Path, monkeypatch):

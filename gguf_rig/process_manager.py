@@ -76,6 +76,9 @@ class ActiveModel:
 _PROM_LINE_RE = re.compile(
     r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([\d.eE+-]+)(?:\s+\d+)?$"
 )
+_API_KEY_VALUE_RE = re.compile(
+    r"(?i)(\bapi[_-]?key\b[^:=]{0,40}[:=]\s*(?:\[\s*)?['\"]?)([^'\"\],\s]+)"
+)
 
 
 def _parse_prometheus_simple(text: str) -> dict[str, float]:
@@ -157,6 +160,13 @@ class VllmServerManager:
         clean = message.rstrip()
         self._log_lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {clean}")
         self._write_event("log", message=clean)
+
+    def _redact_server_log_line(self, line: str) -> str:
+        """Keep vLLM's diagnostic output from persisting API credentials."""
+        redacted = line
+        if self.config.api_key:
+            redacted = redacted.replace(self.config.api_key, "***")
+        return _API_KEY_VALUE_RE.sub(r"\1***", redacted)
 
     def _write_event(self, event: str, **fields: Any) -> None:
         payload = {
@@ -259,8 +269,9 @@ class VllmServerManager:
     def build_command(self, active: ActiveModel) -> list[str]:
         active.validate()
         model = self.library.get(active.model_id)
+        launcher = Path(__file__).resolve().parents[1] / "vllm_launcher.py"
         command = [
-            str(self.config.python_executable), "-m", "vllm.entrypoints.openai.api_server",
+            str(self.config.python_executable), str(launcher),
             "--model", str(model.path),
             "--served-model-name", "current",
             "--host", self.config.api_host,
@@ -464,7 +475,7 @@ class VllmServerManager:
         if process.stdout is None:
             return
         for line in process.stdout:
-            clean = line.rstrip()
+            clean = self._redact_server_log_line(line.rstrip())
             if clean:
                 self._append_log(clean)
                 try:

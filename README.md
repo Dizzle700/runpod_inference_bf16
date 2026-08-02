@@ -29,7 +29,7 @@ RunPod-панель для запуска Hugging Face моделей в фор�
 
 ## RunPod
 
-Используйте актуальный CUDA 13 / vLLM template, network volume с mount path `/workspace` и откройте HTTP-порты `7860,8000`. Для Audio Flamingo Next нужен `vllm==0.20.0` и Transformers 5.6+; старый CUDA 12.8 / Torch 2.8 bootstrap для этой модели не подходит. При собственном Docker image ориентируйтесь на `vllm/vllm-openai:v0.20.0` и совместимый NVIDIA driver.
+Используйте актуальный CUDA 13 / vLLM template, network volume с mount path `/workspace` и откройте HTTP-порты `7860,8000`. Для Audio Flamingo Next нужен `vllm==0.20.0` и Transformers 5.6+; старый CUDA 12.8 / Torch 2.8 bootstrap для этой модели не подходит. При собственном Docker image ориентируйтесь на `vllm/vllm-openai:v0.20.0` и совместимый NVIDIA driver. Проект запускает vLLM через небольшой compatibility launcher: он вычисляет отсутствующие `rote_timestamps` для опубликованного процессора Audio Flamingo Next, без изменения установленного пакета vLLM.
 
 Secrets / Environment Variables:
 
