@@ -23,6 +23,8 @@ def _patch_musicflamingo() -> None:
     from vllm.model_executor.models import musicflamingo
 
     processor_cls = musicflamingo.MusicFlamingoMultiModalProcessor
+    if getattr(processor_cls, "_safetensors_rig_rote_patch", False):
+        return
     original_call_hf_processor = processor_cls._call_hf_processor
 
     def call_hf_processor_with_fallback(self, prompt, mm_data, mm_kwargs, tok_kwargs):
@@ -99,10 +101,12 @@ def _patch_musicflamingo() -> None:
         return self._group_audio_embeddings(audio_features, feature_attention_mask, chunk_counts)
 
     model_cls._process_audio_input = process_audio_input_with_fallback
+    processor_cls._safetensors_rig_rote_patch = True
 
 
 def main() -> None:
     _patch_musicflamingo()
+    print("Safetensors Rig: MusicFlamingo compatibility patch active", flush=True)
     runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
 
 

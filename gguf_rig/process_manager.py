@@ -404,7 +404,24 @@ class VllmServerManager:
         safe_command = ["***" if index and command[index - 1] == "--api-key" else part for index, part in enumerate(command)]
         self._append_log("Starting: " + " ".join(safe_command))
         self._log_handle = self.config.server_log_file.open("a", encoding="utf-8", buffering=1)
-        self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+        project_dir = Path(__file__).resolve().parents[1]
+        runtime_env = os.environ.copy()
+        existing_python_path = runtime_env.get("PYTHONPATH", "")
+        runtime_env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(project_dir), existing_python_path) if part
+        )
+        # vLLM creates a separate Engine Core Python process. sitecustomize.py
+        # makes the MusicFlamingo patch available in both parent and child.
+        runtime_env["SAFETENSORS_VLLM_MUSICFLAMINGO_COMPAT"] = "1"
+        self._process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+            env=runtime_env,
+        )
         self.config.pid_file.write_text(f"{self._process.pid}\n", encoding="utf-8")
         self._active = active
         self._started_at = time.time()
